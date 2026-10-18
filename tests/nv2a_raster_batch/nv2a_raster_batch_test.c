@@ -1,13 +1,16 @@
-/* The software rasteriser drawing a batch of triangles on the worker pool.
+/* The software rasteriser drawing batches of triangles on its workers.
  *
- * A batch's triangles are queued and rasterised together, worker k taking
- * rows y % n == k of every triangle in submission order. Two ways that can go
- * wrong, both silent in a game frame:
+ * A batch's triangles become a job, drawn by the workers after the executor
+ * has moved on; worker k takes rows y % n == k of every triangle in
+ * submission order. Three ways that can go wrong, all silent in a game frame:
  *
  *   - a row nobody owns (a wrong first row for some worker): a stripe of
  *     pixels never drawn;
  *   - triangles out of order within a row: where they overlap, an earlier
- *     triangle shows through a later one.
+ *     triangle shows through a later one;
+ *   - a job drawn with the state of a later batch rather than its own. The
+ *     second batch here turns colour writes off, so a first batch that read
+ *     the live state instead of its copy comes out with holes.
  *
  * So: many overlapping, pixel-aligned solid quads in one batch, with four
  * raster threads. Pixel centres sit at .5, never on a quad edge, so which quad
@@ -47,6 +50,7 @@ void xbox_Nv2aFrameCounterFlip(void) {}
 volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset) { (void)offset; return NULL; }
 
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern void nv2a_pb_exec_sync(void);
 static void m(uint32_t method, uint32_t param) { nv2a_pb_exec_method(0, method, param); }
 static uint32_t f2u(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 static void mf(uint32_t method, float f) { m(method, f2u(f)); }
@@ -133,6 +137,15 @@ int main(void)
     for (start = 0; start < n; start += 240)
         m(0x1810, ((n - start > 240 ? 240 : n - start) - 1) << 24 | start);
     m(0x17FC, 0);
+
+    /* No sync: the same quads again with colour writes off, which must draw
+     * nothing -- and must not reach the batch above, still being drawn. */
+    m(0x0358, 0);                            /* SET_COLOR_MASK: none */
+    m(0x17FC, 5);
+    for (start = 0; start < n; start += 240)
+        m(0x1810, ((n - start > 240 ? 240 : n - start) - 1) << 24 | start);
+    m(0x17FC, 0);
+    nv2a_pb_exec_sync();                     /* as the pushbuffer walk does */
 
     for (y = 0; y < H; y++) {
         for (x = 0; x < W; x++) {
