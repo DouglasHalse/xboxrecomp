@@ -316,6 +316,29 @@ static void snap_trigger_poll(const uint32_t *hi, uint32_t hi_w, uint32_t hi_h)
     s_dump_quiet = 0;
 }
 
+/* The frame the window is showing, for the title's own diagnostics (SSX 3
+ * takes one for its player mark). Same choice as the snap trigger: the
+ * renderer's published frame when there is a current one, else the guest
+ * framebuffer, which a GPU renderer leaves unused. */
+void xbox_FramebufferSnapshot(const char *path)
+{
+    int quiet;
+
+    if (!path || !path[0])
+        return;
+    pthread_mutex_lock(&s_hi_lock);
+    if (s_hi && now_ms() - s_hi_at < 250.0) {
+        write_bmp(path, s_hi, s_hi_w, s_hi_h);
+        pthread_mutex_unlock(&s_hi_lock);
+        return;
+    }
+    pthread_mutex_unlock(&s_hi_lock);
+    quiet = s_dump_quiet;
+    s_dump_quiet = 1;
+    (void)xbox_FramebufferDumpBmp(path);
+    s_dump_quiet = quiet;
+}
+
 static void *fb_thread(void *unused)
 {
     SDL_Window *win;

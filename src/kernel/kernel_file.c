@@ -69,6 +69,22 @@ uint32_t xbox_LastFileError(void)
     return g_xbox_last_file_error;
 }
 
+/* Hook a title can install to observe its own file traffic -- SSX 3 journals
+ * saves and loads from it (it matches a save's Data.ssx open to name the
+ * event). Called once per successful open with the name as the title asked for
+ * it, and whether the open can write. NULL unless a title installs one, so the
+ * cost is a load and a branch per open. The Windows backend does not call it
+ * yet: it would have to convert the wide path back, and no title that installs
+ * the hook has been built for Windows. */
+void (*volatile xbox_file_hook)(const char* xbox_path, int write, int32_t status) = NULL;
+
+/* True when an open with these access rights can write. */
+static int file_access_writes(ACCESS_MASK access)
+{
+    return (access & (XBOX_GENERIC_WRITE | XBOX_GENERIC_ALL |
+                      XBOX_FILE_WRITE_DATA | XBOX_FILE_APPEND_DATA)) != 0;
+}
+
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
@@ -950,6 +966,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
      * scan state filed under that address belongs to the previous life of the
      * handle and must not be continued (see dir_context_release). */
     dir_context_release(*FileHandle);
+    if (xbox_file_hook)
+        xbox_file_hook(xbox_path, file_access_writes(DesiredAccess), (int32_t)STATUS_SUCCESS);
     if (file_trace() && (strstr(host_path, "UDATA") || strstr(host_path, "TDATA")))
         fprintf(stderr, "  [FILE-T] create '%s' disp=%u access=0x%X opts=0x%X -> handle=%p\n",
                 host_path, (unsigned)CreateDisposition, (unsigned)DesiredAccess,

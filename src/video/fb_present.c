@@ -612,6 +612,15 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+
+/* The frame the window is showing, for the title's own diagnostics (SSX 3
+ * takes one for its player mark). The Windows/D3D11 presenter shows one frame at a time, so this
+ * is the same image its dump entry point writes. */
+void xbox_FramebufferSnapshot(const char *path)
+{
+    (void)xbox_FramebufferDumpBmp(path);
+}
+
 /* RECOMP_SNAP_TRIGGER=<file>: when the file appears, write the frame being
  * shown to the BMP path it contains and delete it. Screenshots taken from
  * inside work whatever presents the frame -- PrintWindow cannot read a D3D11

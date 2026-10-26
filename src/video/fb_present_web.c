@@ -256,6 +256,15 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+
+/* The frame the window is showing, for the title's own diagnostics (SSX 3
+ * takes one for its player mark). The browser presenter shows one frame at a time, so this
+ * is the same image its dump entry point writes. */
+void xbox_FramebufferSnapshot(const char *path)
+{
+    (void)xbox_FramebufferDumpBmp(path);
+}
+
 void xbox_FramebufferWindowStart(void)
 {
     if (!getenv("RECOMP_FB_WINDOW"))
