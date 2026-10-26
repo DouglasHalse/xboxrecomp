@@ -20,10 +20,18 @@
  */
 
 #include "apu_state.h"
+#include "kernel/guest_ptr.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 #include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+
+#if defined(__ANDROID__)
+#include <sys/resource.h>
+#endif
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 /* ============================================================
  * Globals
@@ -77,10 +85,10 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
-        return g_apu_ram_ptr + a;
+        return XBOX_HOST(a);
     if (a < xbox_ContiguousAllocatedBytes())
-        return g_apu_ram_ptr + 0x80000000u + a;
-    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+        return XBOX_HOST(0x80000000u + a);
+    return XBOX_HOST(a & 0x03FFFFFFu);
 }
 
 /* The interrupt line, as the frame thread sees it. update_irq used to call
@@ -149,8 +157,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
-    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
-    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    routine = *(uint32_t *)(XBOX_HOST(kint) + 0);
+    context = *(uint32_t *)(XBOX_HOST(kint) + 4);
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
         return;
@@ -168,9 +176,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = context;
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = kint;
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
@@ -319,12 +327,15 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
-    /* Try XAudio2 first (lower latency) */
-    if (xa2_init()) {
-        fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
-        return;
+    /* Try XAudio2 first (lower latency); RECOMP_AUDIO=waveout skips it. */
+    {
+        const char *ab = getenv("RECOMP_AUDIO");
+        if (!(ab && !strcmp(ab, "waveout")) && xa2_init()) {
+            fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+            return;
+        }
     }
-    fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
+    fprintf(stderr, "[APU] XAudio2 unavailable or not wanted, using waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -377,9 +388,96 @@ void mcpx_apu_monitor_finalize(MCPXAPUState *d)
             g_waveout.frames_written);
 }
 
+/* Set by se_frame around its monitor call: monitor.frame_buf then already
+ * holds the voice processor's 256 samples (8 VP frames of 32, written by
+ * mcpx_apu_dsp_frame) and must be kept, not cleared. */
+static int g_vp_frame;
+
+/* Time split for the [APU-LEVEL] line: how much of each second the frame
+ * thread spends inside the frame and how much of that is the submit into SDL
+ * (which locks the audio device and can block behind its callback thread). */
+static int64_t g_frame_us, g_submit_us;
+static int64_t g_iter_us, g_irq_us;
+static int64_t g_thr_us, g_upd_us, g_idle_us;
+static int g_iter_count;
+
+/* Defined in apu_vp.c: guest threads blocked on the APU lock (voice_lock no
+ * longer takes it, so this is normally zero). */
+extern volatile long g_apu_lock_waiters;
+
+/* RECOMP_APU_LEVEL=1: once a second, the peak level of what was submitted
+ * and how much of it came from the voice processor. */
+static void apu_level_note(const int16_t *buf, int n, int from_vp)
+{
+    static int on = -1;
+    static int peak, vp_peak, bufs, vp_bufs;
+    static int64_t last;
+    int i, p = 0;
+    if (on < 0)
+        on = getenv("RECOMP_APU_LEVEL") != NULL;
+    if (!on)
+        return;
+    for (i = 0; i < n * 2; i++) {
+        int v = buf[i] < 0 ? -buf[i] : buf[i];
+        if (v > p) p = v;
+    }
+    if (p > peak) peak = p;
+    bufs++;
+    if (from_vp) { vp_bufs++; if (p > vp_peak) vp_peak = p; }
+    if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - last >= 1000) {
+        last = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        int under, drops, minq, waits, refills;
+        xa2_take_stats(&under, &drops, &minq, &waits, &refills);
+        fprintf(stderr, "[APU-LEVEL] peak %d (vp peak %d) | buffers %d (vp %d) | frames/s %d"
+                " | underruns %d drops %d waits %d refills %d min queued %d | util %.2f"
+                " | frame %d ms/s submit %d ms/s | iter %d/s %d ms/s irq %d ms/s"
+                " | thr %d upd %d idle %d\n",
+                peak, vp_peak, bufs, vp_bufs, g_dbg.frames_processed, under, drops,
+                waits, refills, minq, g_dbg.utilization,
+                (int)(g_frame_us / 1000), (int)(g_submit_us / 1000),
+                g_iter_count, (int)(g_iter_us / 1000), (int)(g_irq_us / 1000),
+                (int)(g_thr_us / 1000), (int)(g_upd_us / 1000), (int)(g_idle_us / 1000));
+        g_frame_us = g_submit_us = g_iter_us = g_irq_us = 0;
+        g_thr_us = g_upd_us = g_idle_us = 0;
+        g_iter_count = 0;
+        peak = vp_peak = bufs = vp_bufs = 0;
+    }
+}
+
 void mcpx_apu_monitor_frame(MCPXAPUState *d)
 {
     if ((d->ep_frame_div + 1) % 8) {
+        return;
+    }
+
+    /* XAudio2, voice-processor frame: the guest's own mix is already in
+     * frame_buf. Clearing it here (as the path below does) silenced every
+     * title that drives the APU directly -- SSX 3's statically linked
+     * DirectSound -- while the software mixer and test tone still played.
+     * Add the software mixer on top and submit exactly these 256 samples. */
+    if (xa2_is_active() && g_vp_frame) {
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < 256; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
+            }
+        }
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, 256);
+        /* Measured before the mute: a muted test run still shows whether
+         * the title produced sound. */
+        apu_level_note(&d->monitor.frame_buf[0][0], 256, 1);
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        {
+            int64_t s0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            xa2_submit_samples(&d->monitor.frame_buf[0][0], 256);
+            g_submit_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - s0;
+        }
         return;
     }
 
@@ -413,11 +511,47 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             remaining -= chunk;
         }
 
+        apu_level_note(&xa2_tmp[0][0], buf_size, 0);
         xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
         return;
     }
 
     if (!g_waveout.initialized) return;
+
+    /* waveOut, voice-processor frame: the same fix as XAudio2 above -- keep
+     * the guest's 256 samples (plus the software mixer) instead of clearing
+     * them, and fill the 2048-sample waveOut buffer from successive frames,
+     * submitting it when full. */
+    if (g_vp_frame) {
+        static int16_t acc[WAVEOUT_BUF_SAMPLES][2];
+        static int acc_n;
+        if (!g_audio_muted)
+            mixer_render(d->monitor.frame_buf, 256);
+        apu_level_note(&d->monitor.frame_buf[0][0], 256, 1);
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        memcpy(acc[acc_n], d->monitor.frame_buf, 256 * 2 * sizeof(int16_t));
+        acc_n += 256;
+        if (acc_n < WAVEOUT_BUF_SAMPLES)
+            return;
+        acc_n = 0;
+        {
+            int vi = g_waveout.next_buf, wl = 0;
+            WAVEHDR *vh = &g_waveout.hdrs[vi];
+            while (!(vh->dwFlags & WHDR_DONE) && (vh->dwFlags & WHDR_INQUEUE)) {
+                qemu_mutex_unlock(&d->lock);
+                Sleep(1);
+                qemu_mutex_lock(&d->lock);
+                if (++wl > 50) break;
+            }
+            memcpy(g_waveout.bufs[vi], acc, sizeof acc);
+            vh->dwFlags &= ~WHDR_DONE;
+            waveOutWrite(g_waveout.hwo, vh, sizeof(WAVEHDR));
+            g_waveout.next_buf = (vi + 1) % WAVEOUT_NUM_BUFS;
+            g_waveout.frames_written++;
+        }
+        return;
+    }
 
     int idx = g_waveout.next_buf;
     WAVEHDR *hdr = &g_waveout.hdrs[idx];
@@ -483,10 +617,39 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    /* Resync only when far behind. The wait below is in whole milliseconds
+     * and Windows wakes on its timer tick, so being a few milliseconds late
+     * is the normal case; resetting the schedule whenever a wake came more
+     * than one 5.3 ms output frame late threw that time away every time,
+     * and the voice processor ran at ~85% of real time -- audible as gaps
+     * once its output reached the speakers. Catching up instead keeps the
+     * average at 48 kHz; the output queue absorbs the bursts. */
+    /* Resync only when the thread really stalled (a pause, a long deschedule),
+     * not for the few ms of lateness each period accumulates. Resetting the
+     * deadline threw that debt away roughly every 0.26 s -- exactly the audio
+     * time the voice processor then never produced, so it ran at ~80% of real
+     * time and the speakers heard gaps: choppy sound that also drags. Keep the
+     * debt instead; while behind, the loop below does not wait at all and pays
+     * it back, which keeps the average at 48 kHz. */
     if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+        now_us - d->next_frame_time_us > 1000000) {   /* > 1 s: give up on the debt */
         d->next_frame_time_us = now_us;
     }
+#if defined(_WIN32)
+    {
+        static int period_set;
+        if (!period_set) {
+            period_set = 1;
+            timeBeginPeriod(1);        /* 1 ms waits, not the 15.6 ms tick */
+        }
+    }
+#endif
+
+    /* The output queue is not probed here. SDL_GetQueuedAudioSize takes the
+     * audio device's lock, which SDL's own AAudio thread holds while it waits
+     * for the device: ~1 ms per call, a fifth of the 5.3 ms frame, which alone
+     * cost that fifth of the audio. The submit side already refuses to queue
+     * more than 12 buffers, so a full queue is handled where it is cheap. */
 
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -530,7 +693,9 @@ static void se_frame(MCPXAPUState *d)
 
     mcpx_apu_vp_frame(d, mixbins);
     mcpx_apu_dsp_frame(d, mixbins);
+    g_vp_frame = d->monitor.point != MCPX_APU_DEBUG_MON_VP;
     mcpx_apu_monitor_frame(d);
+    g_vp_frame = 0;
 
     d->ep_frame_div++;
 
@@ -544,21 +709,50 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(_WIN32)
+    /* The audio clock: a wake that comes late is a gap at the speakers once
+     * the output queue's cushion is used up, and the game's own threads
+     * keep every core busy. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif defined(__ANDROID__)
+    /* THREAD_PRIORITY_AUDIO (-16). This thread is the sound card's clock; on a
+     * phone the game, renderer and Vulkan driver threads otherwise preempt it
+     * often enough that it loses a millisecond or two per 5.3 ms frame. Apps
+     * may lower nice for their own threads; if the platform refuses, say so
+     * once and carry on. */
+    if (setpriority(PRIO_PROCESS, 0, -16) != 0)
+        fprintf(stderr, "[APU] frame thread priority unchanged (setpriority failed)\n");
+    else
+        fprintf(stderr, "[APU] frame thread at audio priority (-16)\n");
+#endif
+#if !defined(_WIN32)
+    /* Visible in /proc/<pid>/task/<tid>/comm and top -H: the audio clock is the
+     * first thread to look at when the sound stutters. */
+    pthread_setname_np(pthread_self(), "apu-frame");
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
+        int64_t t_iter0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        g_iter_count++;
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
+            int64_t iw = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
             qemu_cond_wait(&d->cond, &d->lock);
             d->is_idle = false;
+            g_idle_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - iw;
             continue;
         }
 
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
+        {
+            int64_t tw = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            throttle(d);
+            g_thr_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - tw;
+        }
 
         /* The doorbell ack stands in for the GP DSP, which on hardware runs
          * whatever the front end is doing. Tying it to se_frame stopped it
@@ -576,7 +770,9 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            int64_t f0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             se_frame(d);
+            g_frame_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - f0;
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
@@ -588,24 +784,42 @@ static void *mcpx_apu_frame_thread(void *arg)
          * the interrupt line. Nothing here ever did, so the line never rose
          * even before there was anything to deliver it to. */
         if (d->set_irq) {
+            int64_t u0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
             update_irq(d);
+            g_upd_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - u0;
             d->set_irq = false;
         }
-        apu_deliver_irq(d);
+        {
+            int64_t i0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+            apu_deliver_irq(d);
+            g_irq_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - i0;
+        }
 
-        /* Let the guest in once per frame.
-         *
-         * The thread holds d->lock for its whole loop and only drops it inside
-         * throttle()'s wait. Once voices really play, processing can run
-         * behind real time, throttle never waits, and the lock is never
-         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
-         * it (voice_lock). A critical section is not fair, so the title's
-         * thread starved there indefinitely: Burnout 3 froze on its vehicle
-         * select, blocked in voice_lock at raised IRQL, which in turn held
-         * off every USB interrupt. */
-        qemu_mutex_unlock(&d->lock);
-        SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        /* Let the guest in once per frame -- but only when something is
+         * actually waiting for the APU lock. voice_lock is lock-free now, so
+         * normally nothing is, and the handover is not free: the yield costs
+         * ~0.8 ms per frame on a phone, a fifth of the audio frame, which was
+         * the last thing keeping the voice processor below real time. */
+        if (qatomic_read(&g_apu_lock_waiters) > 0) {
+            qemu_mutex_unlock(&d->lock);
+            SwitchToThread();
+            {
+                /* Hand over, not just offer: a guest thread waiting in
+                 * voice_lock (with the guest CPU held) did not always get in at
+                 * this brief release -- waits of ~26 ms were seen. Yield until
+                 * it has the lock, but never past the frame clock's slack. */
+                extern volatile long g_apu_lock_waiters;
+                int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                int64_t until = now + 2000;
+                if (d->next_frame_time_us > 0 && d->next_frame_time_us < until)
+                    until = d->next_frame_time_us;
+                while (qatomic_read(&g_apu_lock_waiters) > 0
+                       && qemu_clock_get_us(QEMU_CLOCK_REALTIME) < until)
+                    SwitchToThread();
+            }
+            qemu_mutex_lock(&d->lock);
+        }
+        g_iter_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t_iter0;
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -691,6 +905,14 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     mcpx_apu_monitor_init(d, &local_err);
     if (local_err) {
         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
+    }
+
+    /* RECOMP_MUTE=1: play silence (scripted test runs, so they make no
+     * noise). Everything else runs as usual, timing included. */
+    {
+        const char *m = getenv("RECOMP_MUTE");
+        if (m && *m && *m != '0')
+            g_audio_muted = 1;
     }
 
     /* Start background frame thread */

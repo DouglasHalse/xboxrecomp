@@ -40,6 +40,9 @@ if(WIN32)
     # target to actually call into the APU failed at link with an undefined
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
+elseif(EMSCRIPTEN)
+    # xa2_* feed an AudioWorklet (apu_xaudio2.c, web/ in the game project)
+    target_link_libraries(xbox_apu PRIVATE platform m)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)

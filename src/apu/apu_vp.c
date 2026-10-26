@@ -140,20 +140,36 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/* Guest threads waiting for d->lock: the frame thread hands the lock over to
+ * them at its next frame boundary (apu_core.c). voice_lock no longer takes the
+ * lock (see below), so this stays at zero; the frame thread still tests it. */
+volatile long g_apu_lock_waiters;
+
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
-    assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
-
     uint64_t mask = 1ULL << (v % 64);
-    if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
-    } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
-    }
+    volatile uint64_t *slot = &d->vp.voice_locked[v / 64];
 
-    qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
+    assert(v < MCPX_HW_MAX_VOICES);
+    /* This sets or clears one bit in the voice-locked map -- nothing else.
+     * Taking the APU mutex for it was the guest's hot path: DirectSound locks
+     * and unlocks a voice around every update, so the map was held for the
+     * greater part of every second, and the frame thread (the sound card's
+     * clock) waited for that mutex and produced ~20% less audio than real time
+     * -- heard as sound that drags and breaks up. The frame side reads the map
+     * with qatomic_read, so a voice that changes state mid-frame is just the
+     * timing the hardware has. */
+#if defined(_MSC_VER)
+    if (lock)
+        _InterlockedOr64((volatile __int64 *)slot, (__int64)mask);
+    else
+        _InterlockedAnd64((volatile __int64 *)slot, (__int64)~mask);
+#else
+    if (lock)
+        __sync_fetch_and_or(slot, mask);
+    else
+        __sync_fetch_and_and(slot, ~mask);
+#endif
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)

@@ -23,8 +23,13 @@
  */
 
 #include "apu_state.h"
+#include "kernel/guest_ptr.h"
 #include "fpconv.h"
+#include "apu_xaudio2.h"
+extern volatile int g_audio_muted;
 
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -103,7 +108,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
     if (!d->ram_ptr)
         return;
     for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+        uint32_t *slot = (uint32_t *)(XBOX_HOST(s_dsp_ack[i]));
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
@@ -157,7 +162,34 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    {
+        /* RECOMP_APU_BINS=1: once a second, the RMS level of every mixbin
+         * that carried sound (DirectSound: 0-5 speakers, 6-9 crosstalk, 10
+         * the I3DL2 reverb send, 11+ FX sends) -- which bins a title feeds
+         * the effects processor this mixdown stands in for. */
+        static int on = -1;
+        static double sum[NUM_MIXBINS];
+        static unsigned frames;
+        if (on < 0)
+            on = getenv("RECOMP_APU_BINS") != NULL;
+        if (on) {
+            for (int b = 0; b < NUM_MIXBINS; ++b)
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; ++i)
+                    sum[b] += (double)mixbins[b][i] * mixbins[b][i];
+            if (++frames >= 1500) {          /* 1500 x 32 samples = 1 s at 48 kHz */
+                fprintf(stderr, "[APU-BINS] rms");
+                for (int b = 0; b < NUM_MIXBINS; ++b)
+                    if (sum[b] > 0.0)
+                        fprintf(stderr, " %d:%.4f", b, sqrt(sum[b] / (frames * NUM_SAMPLES_PER_FRAME)));
+                fprintf(stderr, "\n");
+                memset(sum, 0, sizeof sum);
+                frames = 0;
+            }
+        }
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        const int surround = xa2_channels() == 6 && mcpx_apu_mixdown_all();
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -188,9 +220,32 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * mixdown that stops discarding audio. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
+                /* Bins 0-5 are DirectSound's speakers (FL FR C LFE BL BR):
+                 * the standard stereo downmix -- centre and rears at -3 dB
+                 * into both sides / their side, LFE at -6 dB into both. The
+                 * even/odd rule below put the whole centre channel in the
+                 * left speaker (SSX 3 feeds bins 0, 1, 2, 4, 5). Bins 6 and
+                 * up keep the even-left / odd-right pairing. */
+                const float k3 = 0.70710678f, k6 = 0.5f;
+                if (surround) {
+                    /* 5.1 out (RECOMP_AUDIO_CHANNELS=6): the speakers as
+                     * they are; centre, LFE and rears go beside the front
+                     * pair (apu_xaudio2.c). */
+                    int16_t s4[4];
+                    for (int c = 0; c < 4; ++c) {
+                        float v = g_audio_muted ? 0.0f : mixbins[2 + c][i];
+                        if (v > 1.0f) v = 1.0f;
+                        if (v < -1.0f) v = -1.0f;
+                        s4[c] = (int16_t)(v * 32767.0f);
+                    }
+                    xa2_surround_push(s4, 1);
+                    left = mixbins[0][i];
+                    right = mixbins[1][i];
+                } else {
+                    left  = mixbins[0][i] + k3 * mixbins[2][i] + k6 * mixbins[3][i] + k3 * mixbins[4][i];
+                    right = mixbins[1][i] + k3 * mixbins[2][i] + k6 * mixbins[3][i] + k3 * mixbins[5][i];
+                }
+                for (int b = 6; b < NUM_MIXBINS; ++b) {
                     if (b & 1) right += mixbins[b][i];
                     else       left  += mixbins[b][i];
                 }
