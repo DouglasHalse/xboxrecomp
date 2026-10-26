@@ -591,6 +591,17 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+void (*volatile xbox_pad_override)(uint8_t *report20) = NULL;
+
+/* Merge the on-screen pad into a finished report. Pad 0 only: a title reads
+ * player 1 from the first pad, and a second report would fight the host pad for
+ * the same buttons. */
+static void pad_touch_apply(int pad, uint8_t *out)
+{
+    if (pad == 0 && xbox_pad_override)
+        xbox_pad_override(out);
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -646,6 +657,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        pad_touch_apply(pad, out);
         return 20;
     }
 
@@ -663,5 +675,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    pad_touch_apply(pad, out);
     return 20;
 }

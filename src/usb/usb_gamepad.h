@@ -36,6 +36,12 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
 /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
 int usb_gamepad_report(int pad, uint8_t *out, int max);
 
+/* An on-screen pad (Android touch controls) installs this to report as pad 0 on
+ * top of the host's own pad: it ORs its digital bits into report[2], raises the
+ * analog values in report[4..11] and writes the sticks at report[12..19] while
+ * one is held. NULL when nothing is installed. */
+extern void (*volatile xbox_pad_override)(uint8_t *report20);
+
 /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
  * and whether it has been configured. */
 uint8_t usb_gamepad_address(int pad);

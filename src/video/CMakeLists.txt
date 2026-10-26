@@ -11,6 +11,10 @@ if(EMSCRIPTEN)
 elseif(NOT WIN32)
     target_sources(xbox_video PRIVATE fb_present_sdl.c)
 endif()
+if(ANDROID)
+    # On-screen controls, drawn by the SDL presenter.
+    target_sources(xbox_video PRIVATE touch_pad.c)
+endif()
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..

@@ -8,6 +8,9 @@
 #if !defined(_WIN32)
 #define _GNU_SOURCE
 #include <SDL2/SDL.h>
+#if defined(__ANDROID__)
+#include "touch_pad.h"
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -376,6 +379,9 @@ static void *fb_thread(void *unused)
         return NULL;
     }
     SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
+#if defined(__ANDROID__)
+    touch_pad_init();
+#endif
     s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
@@ -391,6 +397,12 @@ static void *fb_thread(void *unused)
                  * next flip reopened it. */
                 fflush(NULL);
                 _exit(0);
+#if defined(__ANDROID__)
+            } else if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
+                       e.type == SDL_FINGERUP || e.type == SDL_MOUSEBUTTONDOWN ||
+                       e.type == SDL_MOUSEBUTTONUP || e.type == SDL_MOUSEMOTION) {
+                touch_pad_event(&e, ren);
+#endif
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 int vk = sdl_to_vk(e.key.keysym.sym);
                 /* RECOMP_KEY_TRACE: each key as it arrives, as in fb_present.c,
@@ -446,6 +458,9 @@ static void *fb_thread(void *unused)
                 }
                 SDL_RenderClear(ren);
                 SDL_RenderCopy(ren, hi_tex, NULL, NULL);
+#if defined(__ANDROID__)
+                touch_pad_render(ren);
+#endif
                 SDL_RenderPresent(ren);
                 snap_trigger_poll(hi_rgb, hi_w, hi_h);
                 goto shown;
@@ -474,6 +489,9 @@ static void *fb_thread(void *unused)
         SDL_UpdateTexture(tex, NULL, s_rgb, (int)(s_fb_width * 4));
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, NULL, NULL);
+#if defined(__ANDROID__)
+        touch_pad_render(ren);
+#endif
         SDL_RenderPresent(ren);
         snap_trigger_poll(NULL, 0, 0);
 shown:
