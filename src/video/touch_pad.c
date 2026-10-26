@@ -75,7 +75,7 @@ enum kind { KIND_STICK, KIND_BUTTON, KIND_TRIGGER, KIND_ARROW };
 enum {
     BTN_NONE = 0,
     BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT,
-    BTN_START, BTN_BACK, BTN_L3, BTN_R3,
+    BTN_START, BTN_BACK,
     BTN_A, BTN_B, BTN_X, BTN_Y,
     BTN_LB, BTN_LT, BTN_RB, BTN_RT
 };
@@ -89,7 +89,7 @@ typedef struct {
     SDL_Color   label_color;
 } control;
 
-#define CONTROL_COUNT 18
+#define CONTROL_COUNT 16
 
 static const SDL_Color kLabel = { LABEL_R, LABEL_G, LABEL_B, LABEL_A };
 static const float     kDeadZone = 0.12f;
@@ -137,12 +137,12 @@ static void build_layout(control *c, float w, float h)
         c[n++] = (control){ KIND_ARROW, dx + arm, dy, dr, BTN_RIGHT, 3, "", kLabel };
     }
 
-    /* LT over LB above the left stick, L3 beside LB. */
+    /* LT over LB above the left stick. The reference also puts L3 here; SSX 3
+     * binds nothing to a stick click, so the button would be dead. */
     {
-        float br = 0.048f * h, small = 0.036f * h;
+        float br = 0.048f * h;
         c[n++] = (control){ KIND_TRIGGER, lx, 0.355f * h, br, BTN_LT, 0, "LT", kLabel };
         c[n++] = (control){ KIND_BUTTON, lx, 0.475f * h, br, BTN_LB, 0, "LB", kLabel };
-        c[n++] = (control){ KIND_BUTTON, lx + 0.115f * h, 0.475f * h, small, BTN_L3, 0, "L3", kLabel };
     }
 
     /* A/B/X/Y diamond in the lower right, with the Xbox 360 letter colours. */
@@ -155,13 +155,12 @@ static void build_layout(control *c, float w, float h)
         c[n++] = (control){ KIND_BUTTON, fx, fy - fs, fr, BTN_Y, 0, "Y", y };
     }
 
-    /* RT over RB at the right edge, R3 beside RB. */
+    /* RT over RB at the right edge (no R3, for the same reason). */
     {
-        float br = 0.048f * h, small = 0.036f * h;
+        float br = 0.048f * h;
         float rx = w - 0.17f * h;
         c[n++] = (control){ KIND_TRIGGER, rx, 0.47f * h, br, BTN_RT, 1, "RT", kLabel };
         c[n++] = (control){ KIND_BUTTON, rx, 0.59f * h, br, BTN_RB, 0, "RB", kLabel };
-        c[n++] = (control){ KIND_BUTTON, rx - 0.115f * h, 0.59f * h, small, BTN_R3, 0, "R3", kLabel };
     }
 
     /* BACK and START in the middle of the top edge. */
@@ -433,7 +432,6 @@ static void set_button(int button, int on)
         { BTN_UP,    0x01, -1 }, { BTN_DOWN,  0x02, -1 },
         { BTN_LEFT,  0x04, -1 }, { BTN_RIGHT, 0x08, -1 },
         { BTN_START, 0x10, -1 }, { BTN_BACK,  0x20, -1 },
-        { BTN_L3,    0x40, -1 }, { BTN_R3,    0x80, -1 },
         { BTN_A,     0x00,  0 }, { BTN_B,     0x00,  1 },
         { BTN_X,     0x00,  2 }, { BTN_Y,     0x00,  3 },
         /* The original Xbox pad has analog L/R instead of LB/RB: a bumper
