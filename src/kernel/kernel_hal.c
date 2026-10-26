@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "guest_ptr.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
@@ -135,7 +136,7 @@ static void irql_holder_add(void *ra)
             s_holders[i].ra = ra;
             s_holders[i].guest_esp = g_esp;
             s_holders[i].guest_ra = g_esp
-                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+                ? *(uint32_t *)((uintptr_t)XBOX_HOST(g_esp)) : 0;
             return;
         }
 }
@@ -209,9 +210,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+extern void guest_cpu_irq_enter(void);
+extern void guest_cpu_irq_leave(void);
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    guest_cpu_irq_enter();             /* one CPU: the routine runs alone */
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
@@ -227,6 +232,7 @@ void xbox_IrqlLeaveInterrupt(int saved)
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    guest_cpu_irq_leave();
 }
 
 /*
@@ -309,9 +315,10 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 volatile ULONG xbox_KeTickCount = 0;
 
 /* Call this periodically or on-demand to update KeTickCount */
+extern uint32_t xbox_TickCountMs(void);   /* xbox_memory_layout.c: 1 ms clock */
 static void xbox_update_tick_count(void)
 {
-    xbox_KeTickCount = GetTickCount();
+    xbox_KeTickCount = xbox_TickCountMs();
 }
 
 /* ============================================================================
@@ -446,6 +453,18 @@ NTSTATUS __stdcall xbox_KeRestoreFloatingPointState(PVOID FloatingPointState)
  * recompilation, we log the error and terminate the process.
  * ============================================================================ */
 
+/* Set by the host (e.g. to flush an asynchronous log) and called right
+ * before the process ends itself: ExitProcess stops every other thread at
+ * once, so whatever they had not written yet would be lost. */
+void (*volatile xbox_before_exit)(void);
+
+void xbox_BeforeExit(void)
+{
+    void (*f)(void) = xbox_before_exit;
+    if (f)
+        f();
+}
+
 VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
@@ -456,6 +475,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     DebugBreak();
 #endif
 
+    xbox_BeforeExit();
     ExitProcess(BugCheckCode);
 }
 
@@ -475,6 +495,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     DebugBreak();
 #endif
 
+    xbox_BeforeExit();
     ExitProcess(BugCheckCode);
 }
 
@@ -523,6 +544,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    xbox_BeforeExit();
     ExitProcess(0);
 }
 
@@ -530,6 +552,7 @@ VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
     fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
+    xbox_BeforeExit();
     ExitProcess(0);
 }
 

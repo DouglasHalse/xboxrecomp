@@ -410,6 +410,56 @@ void recomp_trace_esp(const char *name, const char *tag);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+#if defined(__EMSCRIPTEN__)
+/*
+ * WebAssembly: one 32-bit linear memory holds the host and the guest, so the
+ * guest's 4 GB address space cannot be laid out 1:1 and aliased views (the
+ * low-RAM mirrors, contiguous window, tiled aperture) cannot exist. A page
+ * map with 1 MB granularity gives each guest MB its host delta instead:
+ * host = va + g_xbox_pagemap[va >> 20], modulo 2^32. Unmapped MBs share one
+ * scratch MB. Filled by xbox_MemoryLayoutInit (guest_wasm.c).
+ *
+ * There are no page faults either, so device registers (the MCPX span: APU,
+ * AC'97, USB) are checked for on every 8/16/32-bit access. Stores are
+ * explicit (STn, tools/explicit_stores.py) so MEMn can be an rvalue here --
+ * a store not rewritten is a compile error rather than an unchecked write.
+ */
+extern uint32_t g_xbox_pagemap[4096];
+#define XBOX_PTR(addr) ((uintptr_t)((uint32_t)(addr) + g_xbox_pagemap[(uint32_t)(addr) >> 20]))
+#define XBOX_IS_MMIO(a) ((uint32_t)((uint32_t)(a) - 0xFE800000u) < 0x00800000u)
+
+uint32_t xbox_mmio_read(uint32_t va, int size);
+void     xbox_mmio_write(uint32_t va, uint32_t val, int size);
+
+#define RECOMP_LDST(bits, T)                                                  \
+static inline T recomp_ld##bits(uint32_t a) {                                 \
+    if (__builtin_expect(XBOX_IS_MMIO(a), 0))                                 \
+        return (T)xbox_mmio_read(a, bits / 8);                                \
+    return *(volatile T *)XBOX_PTR(a);                                        \
+}                                                                             \
+static inline void recomp_st##bits(uint32_t a, T v) {                         \
+    if (__builtin_expect(XBOX_IS_MMIO(a), 0))                                 \
+        xbox_mmio_write(a, (uint32_t)v, bits / 8);                            \
+    else                                                                      \
+        *(volatile T *)XBOX_PTR(a) = v;                                       \
+}
+RECOMP_LDST(8, uint8_t)
+RECOMP_LDST(16, uint16_t)
+RECOMP_LDST(32, uint32_t)
+#undef RECOMP_LDST
+
+#define MEM8(addr)   recomp_ld8((uint32_t)(addr))
+#define MEM16(addr)  recomp_ld16((uint32_t)(addr))
+#define MEM32(addr)  recomp_ld32((uint32_t)(addr))
+#define SMEM8(addr)  ((int8_t)recomp_ld8((uint32_t)(addr)))
+#define SMEM16(addr) ((int16_t)recomp_ld16((uint32_t)(addr)))
+#define SMEM32(addr) ((int32_t)recomp_ld32((uint32_t)(addr)))
+#define SMEM64(addr) (*(volatile int64_t *)XBOX_PTR(addr))
+#define ST8(addr, v)  recomp_st8((uint32_t)(addr), (uint8_t)(v))
+#define ST16(addr, v) recomp_st16((uint32_t)(addr), (uint16_t)(v))
+#define ST32(addr, v) recomp_st32((uint32_t)(addr), (uint32_t)(v))
+#define ST64(addr, v) (*(volatile int64_t *)XBOX_PTR(addr) = (int64_t)(v))
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 
 /** Read/write N bytes at a flat Xbox memory address. */
@@ -422,6 +472,15 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
 #define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
 #define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+
+
+/** Explicit stores (tools/explicit_stores.py in the game project rewrites
+ * `MEMn(a) = v` into these; see the wasm branch above for why). */
+#define ST8(addr, v)  ((void)(MEM8(addr) = (uint8_t)(v)))
+#define ST16(addr, v) ((void)(MEM16(addr) = (uint16_t)(v)))
+#define ST32(addr, v) ((void)(MEM32(addr) = (uint32_t)(v)))
+#define ST64(addr, v) ((void)(SMEM64(addr) = (int64_t)(v)))
+#endif /* __EMSCRIPTEN__ */
 
 /** Float/double memory access. */
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
@@ -493,8 +552,8 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
 }
 
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
-    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
-    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+    ST32(addr, v.u[0]); ST32(addr + 4, v.u[1]);
+    ST32(addr + 8, v.u[2]); ST32(addr + 12, v.u[3]);
 }
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
@@ -512,8 +571,8 @@ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
 
 static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
                                          int high) {
-    MEM32(addr)     = src.u[high * 2];
-    MEM32(addr + 4) = src.u[high * 2 + 1];
+    ST32(addr, src.u[high * 2]);
+    ST32(addr + 4, src.u[high * 2 + 1]);
 }
 
 /** movlhps: dst high = src low. */
@@ -794,7 +853,7 @@ static inline uint16_t ROR16(uint16_t val, int n) {
 #define PUSH32(sp, val) do { \
     uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
-    MEM32(sp) = _pv; \
+    ST32(sp, _pv); \
 } while(0)
 
 /**
@@ -1109,6 +1168,13 @@ extern volatile uint64_t g_icall_guard_misses;
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
            recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
 } while(0)
+
+/* Preemption point at every loop head (emitted by tools/recomp). Counts
+ * iterations per thread and, every RECOMP_LOOP_QUANTUM of them, lets other
+ * guest threads have the guest CPU when the lock is on (kernel_bridge.c). */
+extern RECOMP_TLS int g_loop_budget;
+void recomp_loop_yield(void);
+#define RECOMP_LOOP_YIELD() do { if (--g_loop_budget < 0) recomp_loop_yield(); } while (0)
 
 /* ================================================================
  * Register name aliases for generated code

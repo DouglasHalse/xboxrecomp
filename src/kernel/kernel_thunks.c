@@ -18,6 +18,7 @@
  */
 
 #include "kernel.h"
+#include "guest_ptr.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -432,7 +433,7 @@ void xbox_kernel_init(void)
 
         if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
             uint32_t entry = *(volatile uint32_t *)
-                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+                ((uintptr_t)XBOX_HOST(thunk_base + i * 4));
             if (entry == 0) {
                 break;  /* rest of the table is empty */
             }

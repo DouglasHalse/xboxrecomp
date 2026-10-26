@@ -7,6 +7,7 @@
  * that decides how the rest gets built.
  */
 #include "ohci.h"
+#include "kernel/guest_ptr.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
@@ -117,7 +118,10 @@ static void wr32(uint32_t va, uint32_t v);
 
 /* The MCPX gives each controller a small root hub. Two ports apiece covers
  * the console's four front sockets, which is what a title enumerates over. */
-#define OHCI_PORTS              2
+/* The MCPX's first OHCI has 4 root ports, and XAPI numbers controller
+ * ports from them: root port 3 is controller port 1 (player 1), 4 is 2, 1 is
+ * 3, 2 is 4. The pads are plugged in that order. */
+#define OHCI_PORTS              4
 
 /* Passes this thread will keep an interrupt back while the guest is at
  * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
@@ -510,20 +514,20 @@ static uint32_t rd32(uint32_t va)
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    return *(uint32_t *)(XBOX_HOST(va));
 }
 static void wr32(uint32_t va, uint32_t v)
 {
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+    *(uint32_t *)(XBOX_HOST(va)) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
     va = bus_resolve(va);
     return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+         ? XBOX_HOST(va) : NULL;
 }
 
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
@@ -639,6 +643,40 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * engine-rev rumble on the Crash countdown and then paused with the
          * pad unresponsive. */
         moved = len;
+        /* Rumble: an XID output report -- 00 06, left motor, right motor
+         * (16-bit each) -- on the interrupt OUT endpoint, or as the data of
+         * a SET_REPORT (21 09) on the control pipe. Forwarded to the host
+         * pad (XInput); RECOMP_RUMBLE=0 ignores it. */
+        if (len >= 6 && guest_ptr(cbp, 6u)
+            && (endpoint != 0 || (g_setup_pending && g_setup.bmRequestType == 0x21
+                                  && g_setup.bRequest == 0x09))) {
+            static int rumble = -1;
+            const uint8_t *r = (const uint8_t *)guest_ptr(cbp, 6u);
+            if (rumble < 0) {
+                const char *e = getenv("RECOMP_RUMBLE");
+                rumble = !(e && *e == '0');
+            }
+            if (rumble && r[0] == 0x00 && r[1] >= 6) {
+                extern DWORD xbox_InputSetState(DWORD port, const void *vibration);
+                uint16_t v[2];
+                v[0] = (uint16_t)(r[2] | r[3] << 8);
+                v[1] = (uint16_t)(r[4] | r[5] << 8);
+                {
+                    /* RECOMP_RUMBLE_TRACE=1: the first 12 motor changes. */
+                    static int tr = -1, said;
+                    static uint16_t last[2];
+                    if (tr < 0)
+                        tr = getenv("RECOMP_RUMBLE_TRACE") != NULL;
+                    if (tr && said < 12 && (v[0] != last[0] || v[1] != last[1])) {
+                        said++;
+                        fprintf(stderr, "  [RUMBLE] pad %d left %u right %u (ep %u)\n",
+                                pad, v[0], v[1], endpoint);
+                    }
+                    last[0] = v[0]; last[1] = v[1];
+                }
+                xbox_InputSetState((DWORD)pad, v);
+            }
+        }
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
@@ -866,8 +904,8 @@ static int ohci_call_isr(OhciController *hc)
         return -1;                      /* nothing connected yet            */
 
     mem     = (uint8_t *)xbox_GetMemoryOffset();
-    routine = *(uint32_t *)(mem + kinterrupt + 0);
-    context = *(uint32_t *)(mem + kinterrupt + 4);
+    routine = *(uint32_t *)(XBOX_HOST(kinterrupt) + 0);
+    context = *(uint32_t *)(XBOX_HOST(kinterrupt) + 4);
     if (!routine)
         return -1;
 
@@ -892,9 +930,9 @@ static int ohci_call_isr(OhciController *hc)
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
 
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = context;      /* arg 2 */
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = kinterrupt;   /* arg 1 */
+    g_esp -= 4; *(uint32_t *)(XBOX_HOST(g_esp)) = 0xDEADBEEFu;  /* return address */
 
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
 
@@ -1054,10 +1092,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
              * XAPI assigns it, and a title that reads "player 1" looks at slot
-             * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
+             * 0. RECOMP_USB_PORT picks it (0..3) so the
              * mapping can be found by measurement rather than assumed. */
+            /* Default root port 3 (index 2) = controller port 1: a title
+             * that reads player 1 without asking which port pressed Start
+             * (SSX 3's debug quick-start menu) sees the pad there. */
             const char *pspec = getenv("RECOMP_USB_PORT");
-            unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
+            unsigned port = pspec ? (unsigned)atoi(pspec) : 2u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
@@ -1065,7 +1106,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             s_plugged_pads = 1;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
-                            "arriving on port 1\n", waited * 20);
+                            "arriving on root port %u\n", waited * 20, port + 1);
             fflush(stderr);
         }
 
@@ -1278,7 +1319,7 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
+#if !defined(__EMSCRIPTEN__)   /* web: accesses are checked, not trapped */
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
@@ -1314,7 +1355,7 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
+#if 1
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
@@ -1338,6 +1379,21 @@ static OhciController *hc_for(uint32_t va)
 int xbox_OhciOwnsAddress(uint32_t xbox_va)
 {
     return hc_for(xbox_va) != NULL;
+}
+
+/* Host-independent access: the caller has already decoded the instruction.
+ * Returns 0 if xbox_va is not an OHCI register. */
+int xbox_OhciMmioAccess(uint32_t xbox_va, int is_write, uint64_t *val, int size)
+{
+    OhciController *hc = hc_for(xbox_va);
+
+    if (!hc)
+        return 0;
+    if (is_write)
+        ohci_write(hc, xbox_va - hc->base, *val, size);
+    else
+        *val = ohci_read(hc, xbox_va - hc->base, size);
+    return 1;
 }
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)

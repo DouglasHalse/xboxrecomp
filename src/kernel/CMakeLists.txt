@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     xbox_memory_layout.c
     guest_vmem.c
+    guest_wasm.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
@@ -44,6 +45,9 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
+elseif(EMSCRIPTEN OR ANDROID)
+    # kernel_crypto.c is self-contained; nothing calls into OpenSSL.
+    target_link_libraries(xbox_kernel PUBLIC platform)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
