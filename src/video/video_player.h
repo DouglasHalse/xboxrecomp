@@ -62,6 +62,11 @@ int  video_dump_frame_bmp(const char *path);
  * zero when there is no window, which is the right answer: with nothing to
  * focus there is nothing to type into. */
 int xbox_FramebufferKeyDown(int vk);
+/* How many times that key went down (auto-repeat not counted) since the last
+ * call, which resets it. For hotkeys checked once a frame: a tap shorter than
+ * a frame, or one followed at once by a focus change (which clears the held
+ * state), still counts. */
+int xbox_FramebufferKeyPresses(int vk);
 
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -70,5 +75,8 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+/* The title's display gamma ramp (256 entries each), applied when presenting
+ * (fb_gamma.c). */
+void xbox_FramebufferSetGammaRamp(const uint8_t *r, const uint8_t *g, const uint8_t *b);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */

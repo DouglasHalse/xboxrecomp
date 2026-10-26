@@ -17,6 +17,13 @@ if(WIN32)
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
+elseif(EMSCRIPTEN OR ANDROID)
+    # No GL/desktop path here: SSX 3 links its own D3D and draws through the
+    # NV2A executor, so the D3D8 HLE library is not needed. Android would
+    # otherwise pull in libepoxy and a desktop GL context.
+    add_library(xbox_d3d8 INTERFACE)
+    target_include_directories(xbox_d3d8 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+    return()
 else()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
