@@ -16,15 +16,9 @@
 > changes behind [SSX3RecompAndroid](https://github.com/DouglasHalse/SSX3RecompAndroid), an
 > Android port of an Xbox game built on this toolkit.
 >
-> Everything Android-specific on this branch was **written by an AI agent**: Hermes Agent (Nous
-> Research) driving a large language model from DeepSeek, in sessions through October 2026, under
-> a human who supplied the game rip, ran the port on a Galaxy S24, reported symptoms and judged
-> every result. That covers the on-screen controls, the POSIX file-layer fixes (rooted names,
-> scan restarts, portable globbing), the guest memory layout for Android's 39-bit addresses, the
-> audio timing work, and the two hooks a title uses to journal its file traffic and take
-> screenshots. It is verified by running the port and its tests, not by review — see the port's
-> README for what that does and does not imply. Upstream's code is untouched in authorship; the
-> changes sit in separate commits on this branch.
+> The Android-specific work on this branch is **AI-written** (Hermes Agent driving a large
+> language model), under a human who supplied the rip and verified results by running the port
+> on a Galaxy S24. Upstream's code is untouched; the changes are separate commits on this branch.
 
 > Turn any Xbox game binary into a native Windows executable. No emulation. No interpreter. Just raw, recompiled C.
 
