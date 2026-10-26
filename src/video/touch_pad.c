@@ -495,6 +495,17 @@ static void touch_report(uint8_t *out)
             vx = (int16_t)(x * 32767.0f);
             vy = (int16_t)(-y * 32767.0f);
         }
+        if (getenv("RECOMP_TOUCH_TRACE")) {
+            /* Only a change worth seeing: what the guest is actually fed when
+             * someone presses a button should stay 0,0. */
+            static int16_t last_x[2], last_y[2];
+            long dx = (long)vx - last_x[i], dy = (long)vy - last_y[i];
+            if (dx > 300 || dx < -300 || dy > 300 || dy < -300) {
+                TLOG("stick %d -> %d,%d", i, (int)vx, (int)vy);
+                last_x[i] = vx;
+                last_y[i] = vy;
+            }
+        }
         if (!vx && !vy)
             continue;
         memcpy(&out[12 + i * 4], &vx, sizeof vx);
@@ -534,30 +545,6 @@ static int finger_slot(SDL_FingerID id)
         if (s_fingers[i].id == id)
             return i;
     return -1;
-}
-
-/* A tap can arrive as a finger or (SDL synthesises these) as a mouse: on the
- * phone both happen depending on the device and the hint, so both are the same
- * pointer here. */
-static SDL_FingerID event_finger(const SDL_Event *e)
-{
-    if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP ||
-        e->type == SDL_MOUSEMOTION)
-        return (SDL_FingerID)1;
-    return e->tfinger.fingerId;
-}
-
-static void event_point(const SDL_Event *e, float w, float h, float *px, float *py)
-{
-    switch (e->type) {
-        case SDL_MOUSEBUTTONDOWN:
-        case SDL_MOUSEBUTTONUP:
-            *px = (float)e->button.x; *py = (float)e->button.y; break;
-        case SDL_MOUSEMOTION:
-            *px = (float)e->motion.x; *py = (float)e->motion.y; break;
-        default:
-            *px = e->tfinger.x * w; *py = e->tfinger.y * h; break;
-    }
 }
 
 static void track_controllers(void)
@@ -631,17 +618,31 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
         return;
     }
 
+    /* Android SDL2 reports each tap twice: as a touch, and as a mouse event it
+     * synthesises from that touch. The touch is normalised against the window
+     * and is correct; the mouse copy is in another space entirely (on this
+     * phone a uniform 2/3 of the surface) and it arrives first, so a press on
+     * START used to be read at 832,52 -- the left half, where the fallback
+     * grabs the left stick -- and the rider lurched. Only touches are read
+     * here; a real mouse on Android would be a device with a controller, and
+     * the pad hides itself for those anyway. */
+    if (e->type != SDL_FINGERDOWN && e->type != SDL_FINGERMOTION &&
+        e->type != SDL_FINGERUP)
+        return;
+
     build_layout(ctrl, (float)s_win_w, (float)s_win_h);
 
     switch (e->type) {
-        case SDL_FINGERDOWN:
-        case SDL_MOUSEBUTTONDOWN: {
-            SDL_FingerID id = event_finger(e);
+        case SDL_FINGERDOWN: {
+            SDL_FingerID id = e->tfinger.fingerId;
 
             if (s_pad_present || s_nfingers >= MAX_FINGERS || finger_slot(id) >= 0)
                 return;
-            event_point(e, (float)s_win_w, (float)s_win_h, &px, &py);
+            px = e->tfinger.x * (float)s_win_w;
+            py = e->tfinger.y * (float)s_win_h;
             index = hit_test(ctrl, px, py, (float)s_win_w);
+            if (index < 0 || index >= CONTROL_COUNT)
+                return;
 
             if (ctrl[index].kind == KIND_STICK) {
                 /* A stick centres under the finger, kept fully on screen; one
@@ -663,16 +664,15 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
                     set_button(ctrl[index].button, 1);
             }
             if (getenv("RECOMP_TOUCH_TRACE"))
-                TLOG("down %.0f,%.0f -> %d %s", (double)px, (double)py, index,
-                     ctrl[index].label);
+                TLOG("down id=%lld %.0f,%.0f -> %d %s", (long long)id, (double)px,
+                     (double)py, index, ctrl[index].label);
             s_fingers[s_nfingers].id = id;
             s_fingers[s_nfingers].ctrl = index;
             s_nfingers++;
             return;
         }
-        case SDL_FINGERMOTION:
-        case SDL_MOUSEMOTION: {
-            SDL_FingerID id = event_finger(e);
+        case SDL_FINGERMOTION: {
+            SDL_FingerID id = e->tfinger.fingerId;
             int slot = finger_slot(id);
             int stick;
 
@@ -681,7 +681,8 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
             index = s_fingers[slot].ctrl;
             if (ctrl[index].kind != KIND_STICK)
                 return;
-            event_point(e, (float)s_win_w, (float)s_win_h, &px, &py);
+            px = e->tfinger.x * (float)s_win_w;
+            py = e->tfinger.y * (float)s_win_h;
             stick = ctrl[index].index;
             {
                 float x = (px - s_stick_ox[stick]) / (ctrl[index].r * 0.85f);
@@ -696,15 +697,16 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
             }
             return;
         }
-        case SDL_FINGERUP:
-        case SDL_MOUSEBUTTONUP: {
-            SDL_FingerID id = event_finger(e);
+        case SDL_FINGERUP: {
+            SDL_FingerID id = e->tfinger.fingerId;
             int slot = finger_slot(id);
 
             if (slot < 0)
                 return;
             index = s_fingers[slot].ctrl;
             s_fingers[slot] = s_fingers[--s_nfingers];
+            if (getenv("RECOMP_TOUCH_TRACE"))
+                TLOG("up id=%lld -> %d %s", (long long)id, index, ctrl[index].label);
             if (ctrl[index].kind == KIND_STICK) {
                 int stick = ctrl[index].index;
                 s_stick_owned[stick] = 0;
