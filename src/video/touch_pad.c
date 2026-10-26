@@ -13,7 +13,9 @@
  *     path builds (xbox_pad_override), so the guest reads it exactly like a
  *     physical controller;
  *   - fingers arrive as SDL_FINGER* events from the presenter's event loop
- *     rather than being re-read from SDL's touch-device list every frame.
+ *     rather than being re-read from SDL's touch-device list every frame;
+ *   - the D-pad is one zone that a held finger slides across, so diagonals
+ *     (down+left) are reachable with one thumb, as on the console pad.
  */
 #include "touch_pad.h"
 
@@ -111,6 +113,17 @@ static int     s_stick_owned[2];
 typedef struct { SDL_FingerID id; int ctrl; } finger;
 static finger  s_fingers[MAX_FINGERS];
 static int     s_nfingers;
+
+/* The D-pad is one zone, not four buttons: a finger lands on it and then slides
+ * between directions the way a thumb moves across the pad on the console, which
+ * is the only way to hold a diagonal (down+left) with one thumb. Direction
+ * changes are measured from where that finger landed, so a small move is
+ * enough and the finger never has to reach the far arrow. */
+static int     s_dp_id = -1;      /* finger holding the D-pad, -1 = none */
+static float   s_dp_ox, s_dp_oy;  /* where it landed */
+static int     s_dp_bits;         /* 1 up, 2 down, 4 left, 8 right */
+
+#define DPAD_SWITCH 0.042f        /* x window height: move this far to switch */
 
 static SDL_Texture *s_disc;       /* white circle, tinted per use */
 
@@ -461,6 +474,8 @@ static void release_all(void)
     s_nfingers = 0;
     s_stick_x[0] = s_stick_x[1] = s_stick_y[0] = s_stick_y[1] = 0.0f;
     s_stick_owned[0] = s_stick_owned[1] = 0;
+    s_dp_id = -1;
+    s_dp_bits = 0;
 }
 
 static void touch_report(uint8_t *out)
@@ -515,11 +530,140 @@ static void touch_report(uint8_t *out)
 
 /* ---- touch handling --------------------------------------------------- */
 
+/* ---- the D-pad -------------------------------------------------------- */
+
+static int arrow_index(const control *c, int button)
+{
+    int i;
+
+    for (i = 0; i < CONTROL_COUNT; i++)
+        if (c[i].kind == KIND_ARROW && c[i].button == button)
+            return i;
+    return -1;
+}
+
+static void dpad_apply(const control *c, int bits)
+{
+    static const int order[4] = { BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT };
+    static const char *name[4] = { "up", "down", "left", "right" };
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        int on = (bits >> i) & 1;
+        int idx = arrow_index(c, order[i]);
+
+        if (idx < 0 || s_held[idx] == on)
+            continue;
+        s_held[idx] = on;
+        set_button(order[i], on);
+        if (getenv("RECOMP_TOUCH_TRACE"))
+            TLOG("dpad %s %s", name[i], on ? "on" : "off");
+    }
+}
+
+static void dpad_start(const control *c, float px, float py)
+{
+    float cx = 0.0f, cy = 0.0f, sw = DPAD_SWITCH * (float)s_win_h;
+    int i, n = 0, bits = 0;
+
+    for (i = 0; i < CONTROL_COUNT; i++)
+        if (c[i].kind == KIND_ARROW) {
+            cx += c[i].x;
+            cy += c[i].y;
+            n++;
+        }
+    if (!n)
+        return;
+    cx /= (float)n;
+    cy /= (float)n;
+
+    /* Where it landed on the pad is the first direction, corners included. */
+    if (py - cy <= -sw * 0.6f) bits |= 1;
+    if (py - cy >=  sw * 0.6f) bits |= 2;
+    if (px - cx <= -sw * 0.6f) bits |= 4;
+    if (px - cx >=  sw * 0.6f) bits |= 8;
+
+    s_dp_ox = px;
+    s_dp_oy = py;
+    s_dp_bits = bits;
+    dpad_apply(c, bits);
+}
+
+static void dpad_motion(const control *c, float px, float py)
+{
+    float dx = px - s_dp_ox, dy = py - s_dp_oy;
+    float sw = DPAD_SWITCH * (float)s_win_h;
+    int bits = s_dp_bits;
+
+    if (fabsf(dx) >= sw || fabsf(dy) >= sw) {
+        bits = 0;
+        if (dx <= -sw) bits |= 4; else if (dx >= sw) bits |= 8;
+        if (dy <= -sw) bits |= 1; else if (dy >= sw) bits |= 2;
+    }
+    if (bits != s_dp_bits) {
+        s_dp_bits = bits;
+        dpad_apply(c, bits);
+    }
+}
+
+static void dpad_end(const control *c)
+{
+    dpad_apply(c, 0);
+    s_dp_bits = 0;
+    s_dp_id = -1;
+}
+
 /* The button under a finger, or the stick of that half of the screen. */
 static int hit_test(const control *c, float px, float py, float w)
 {
     int best = -1, i;
     float best_distance = 1e30f;
+
+    /* The whole pad is a hit, out to the rim of an arrow and a little past it,
+     * so a thumb sliding across it never falls through to the stick. */
+    {
+        float cx = 0.0f, cy = 0.0f, arm = 0.0f, spread;
+        int n = 0, near = -1;
+        float nearest = 1e30f;
+
+        for (i = 0; i < CONTROL_COUNT; i++)
+            if (c[i].kind == KIND_ARROW) {
+                cx += c[i].x;
+                cy += c[i].y;
+                n++;
+            }
+        if (n) {
+            cx /= (float)n;
+            cy /= (float)n;
+            for (i = 0; i < CONTROL_COUNT; i++) {
+                float dx, dy, d;
+                if (c[i].kind != KIND_ARROW)
+                    continue;
+                dx = c[i].x - cx;
+                dy = c[i].y - cy;
+                d = sqrtf(dx * dx + dy * dy);
+                if (d > arm)
+                    arm = d;
+            }
+            spread = arm * 1.5f;
+            if (fabsf(px - cx) <= spread && fabsf(py - cy) <= spread) {
+                for (i = 0; i < CONTROL_COUNT; i++) {
+                    float dx, dy, d;
+                    if (c[i].kind != KIND_ARROW)
+                        continue;
+                    dx = px - c[i].x;
+                    dy = py - c[i].y;
+                    d = sqrtf(dx * dx + dy * dy);
+                    if (d < nearest) {
+                        nearest = d;
+                        near = i;
+                    }
+                }
+                if (near >= 0)
+                    return near;
+            }
+        }
+    }
 
     for (i = 0; i < CONTROL_COUNT; i++) {
         float capture, distance;
@@ -639,7 +783,12 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
             if (index < 0 || index >= CONTROL_COUNT)
                 return;
 
-            if (ctrl[index].kind == KIND_STICK) {
+            if (ctrl[index].kind == KIND_ARROW) {
+                if (s_dp_id >= 0)
+                    return;             /* one finger owns the D-pad */
+                s_dp_id = id;
+                dpad_start(ctrl, px, py);
+            } else if (ctrl[index].kind == KIND_STICK) {
                 /* A stick centres under the finger, kept fully on screen; one
                  * finger per stick. */
                 int stick = ctrl[index].index;
@@ -673,11 +822,15 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
 
             if (slot < 0)
                 return;
+            px = e->tfinger.x * (float)s_win_w;
+            py = e->tfinger.y * (float)s_win_h;
+            if (id == s_dp_id) {
+                dpad_motion(ctrl, px, py);
+                return;
+            }
             index = s_fingers[slot].ctrl;
             if (ctrl[index].kind != KIND_STICK)
                 return;
-            px = e->tfinger.x * (float)s_win_w;
-            py = e->tfinger.y * (float)s_win_h;
             stick = ctrl[index].index;
             {
                 float x = (px - s_stick_ox[stick]) / (ctrl[index].r * 0.85f);
@@ -699,6 +852,8 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
             if (slot < 0)
                 return;
             index = s_fingers[slot].ctrl;
+            if (id == s_dp_id)
+                dpad_end(ctrl);
             s_fingers[slot] = s_fingers[--s_nfingers];
             if (getenv("RECOMP_TOUCH_TRACE"))
                 TLOG("up id=%lld -> %d %s", (long long)id, index, ctrl[index].label);
