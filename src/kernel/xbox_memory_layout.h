@@ -211,6 +211,8 @@ void *xbox_GetMemoryBase(void);
  * Returns 0 if memory is mapped at original Xbox addresses (ideal case).
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
+
+#include "guest_ptr.h"   /* XBOX_HOST, xbox_GuestToHost */
 /* Bytes of guest address space mapped, for bounds-checking a guest pointer
  * that came out of guest memory rather than from this side. */
 size_t xbox_GetMappedSize(void);
@@ -507,5 +509,8 @@ void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline 
 #define XBOX_THREAD_MODE_INLINE 0
 #define XBOX_THREAD_MODE_SPAWN  1
 void xbox_SetThreadMode(int mode);
+
+/* KeTickCount's clock: milliseconds at 1 ms resolution. */
+uint32_t xbox_TickCountMs(void);
 
 #endif /* XBOX_MEMORY_LAYOUT_H */

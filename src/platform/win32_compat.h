@@ -168,6 +168,7 @@ DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 VOID   SwitchToThread(void);
+#define YieldProcessor() sched_yield()
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
 /* ---- Sleep ------------------------------------------------------------ */
@@ -228,6 +229,7 @@ unsigned int _clearfp(void);   /* clear pending FPU exception flags */
 
 /* MSVC stack alloca alias. <alloca.h> provides the underlying function. */
 #include <alloca.h>
+#include <sched.h>
 #define _alloca(n) alloca(n)
 
 /* ---- Win32 file API (POSIX-backed) ----------------------------------- */
@@ -438,7 +440,7 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
  * 
  * Note: GCC needs correct struct. This is from nxdk
  * */
-#ifdef __linux__
+#if defined(__linux__) || defined(__EMSCRIPTEN__)
 typedef struct _EXCEPTION_POINTERS
 {
     PEXCEPTION_RECORD ExceptionRecord;

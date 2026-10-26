@@ -35,7 +35,9 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #else
+#if !defined(__EMSCRIPTEN__)
 #include <sys/sysinfo.h>
+#endif
 #endif
 
 /* ===================================================================== */
@@ -801,7 +803,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = (w32_object *)h;
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* Bionic has no pthread_cancel, and there is no async thread teardown on
+     * Android at all. Mark the thread exited (its waiters see the exit code)
+     * and let it run out; the guest's own TerminateThread calls are rare. */
+    (void)exitCode;
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -1271,7 +1280,23 @@ VOID OutputDebugStringA(LPCSTR str)
     if (str) fputs(str, stderr);
 }
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/threading.h>
+#include <emscripten/em_asm.h>
+/* A title "exits" to reboot (first boot formats the cache partition, then
+ * relaunches itself) or to the dashboard. There is no process to end: tell the
+ * page, which restarts or reports it, and park this thread. */
+static void web_exit(UINT exitCode)
+{
+    fflush(NULL);
+    MAIN_THREAD_ASYNC_EM_ASM({ if (Module.onGuestExit) Module.onGuestExit($0); }, (int)exitCode);
+    for (;;)
+        sleep(1000);
+}
+VOID ExitProcess(UINT exitCode) { web_exit(exitCode); }
+#else
 VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
+#endif
 
 BOOL IsDebuggerPresent(void)
 {
@@ -1311,6 +1336,11 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    /* Bionic's explicit_bzero arrives after our API level; the barrier after
+     * the memset keeps the compiler from dropping the stores. */
+    memset(ptr, 0, cnt);
+    __asm__ __volatile__("" : : "r"(ptr) : "memory");
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1456,7 +1486,11 @@ DWORD XInputGetState(DWORD idx, XINPUT_STATE *state)
 BOOL TerminateProcess(HANDLE process, UINT exitCode)
 {
     (void)process;
+#if defined(__EMSCRIPTEN__)
+    web_exit(exitCode);
+#else
     exit((int)exitCode);
+#endif
 }
 
 VOID OutputDebugStringW(LPCWSTR str)
@@ -1781,6 +1815,18 @@ BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
     b->ullAvailPhys     = avail;
     b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)swap.xsu_total;
     b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
+#elif defined(__EMSCRIPTEN__)
+    /* The wasm heap is the machine: what it may grow to, and what is left. */
+    {
+        extern size_t emscripten_get_heap_max(void);
+        extern size_t emscripten_get_heap_size(void);
+        ULONGLONG max = (ULONGLONG)emscripten_get_heap_max();
+        ULONGLONG used = (ULONGLONG)emscripten_get_heap_size();
+        b->ullTotalPhys     = max;
+        b->ullAvailPhys     = max > used ? max - used : 0;
+        b->ullTotalPageFile = b->ullTotalPhys;
+        b->ullAvailPageFile = b->ullAvailPhys;
+    }
 #else
     struct sysinfo si;
     if (sysinfo(&si) != 0) return FALSE;
