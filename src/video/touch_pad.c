@@ -618,14 +618,9 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
         return;
     }
 
-    /* Android SDL2 reports each tap twice: as a touch, and as a mouse event it
-     * synthesises from that touch. The touch is normalised against the window
-     * and is correct; the mouse copy is in another space entirely (on this
-     * phone a uniform 2/3 of the surface) and it arrives first, so a press on
-     * START used to be read at 832,52 -- the left half, where the fallback
-     * grabs the left stick -- and the rider lurched. Only touches are read
-     * here; a real mouse on Android would be a device with a controller, and
-     * the pad hides itself for those anyway. */
+    /* Touches only. SDL also synthesises a mouse event per tap, in a different
+     * coordinate space (2/3 of the surface on this phone), which made a press
+     * on START land in the left half and grab the stick. */
     if (e->type != SDL_FINGERDOWN && e->type != SDL_FINGERMOTION &&
         e->type != SDL_FINGERUP)
         return;
