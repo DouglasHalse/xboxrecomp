@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "apu_xaudio2.h"
 
@@ -188,6 +189,93 @@ int xa2_is_active(void)
 
 /* Submit a buffer of mixed samples to XAudio2.
  * Called from APU frame thread. Returns 1 if buffer was submitted. */
+/*
+ * RECOMP_AUDIO_WAV=<path> -- write what the game plays, 16-bit stereo at the
+ * mixer's rate, so the soundtrack can be analysed offline against a scripted
+ * ride. The header is patched on exit; a killed process leaves it short by the
+ * frames that were not flushed, which the reader can detect and ignore.
+ */
+#define WAV_RATE 48000
+#define WAV_CHANNELS 2
+
+static FILE *g_wav;
+static long g_wav_bytes;
+static int g_wav_open_tried;
+
+static void wav_put32(unsigned char *p, uint32_t v)
+{
+    p[0] = (unsigned char)(v & 0xFF);
+    p[1] = (unsigned char)((v >> 8) & 0xFF);
+    p[2] = (unsigned char)((v >> 16) & 0xFF);
+    p[3] = (unsigned char)((v >> 24) & 0xFF);
+}
+
+static void wav_tap_open(void)
+{
+    unsigned char h[44];
+    const char *path;
+
+    if (g_wav_open_tried)
+        return;
+    g_wav_open_tried = 1;
+    path = getenv("RECOMP_AUDIO_WAV");
+    if (!path || !*path)
+        return;
+    g_wav = fopen(path, "wb");
+    if (!g_wav) {
+        fprintf(stderr, "[WAV] cannot open %s\n", path);
+        return;
+    }
+    memset(h, 0, sizeof h);
+    memcpy(h + 0, "RIFF", 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    wav_put32(h + 4, 36);
+    wav_put32(h + 16, 16);                 /* fmt chunk size */
+    h[20] = 1;                             /* PCM */
+    h[22] = WAV_CHANNELS;
+    wav_put32(h + 24, WAV_RATE);
+    wav_put32(h + 28, WAV_RATE * WAV_CHANNELS * 2);
+    h[32] = WAV_CHANNELS * 2;              /* block align */
+    h[34] = 16;
+    memcpy(h + 36, "data", 4);
+    fwrite(h, 1, sizeof h, g_wav);
+    fprintf(stderr, "[WAV] capturing the mix to %s\n", path);
+}
+
+static void wav_tap_close(void)
+{
+    unsigned char sz[4];
+
+    if (!g_wav)
+        return;
+    fflush(g_wav);
+    fseek(g_wav, 4, SEEK_SET);
+    wav_put32(sz, (uint32_t)(36 + g_wav_bytes));
+    fwrite(sz, 1, 4, g_wav);
+    fseek(g_wav, 40, SEEK_SET);
+    wav_put32(sz, (uint32_t)g_wav_bytes);
+    fwrite(sz, 1, 4, g_wav);
+    fclose(g_wav);
+    g_wav = NULL;
+}
+
+static void wav_tap(const int16_t *samples, int num_samples)
+{
+    size_t n;
+
+    if (!g_wav_open_tried) {
+        wav_tap_open();
+        if (g_wav)
+            atexit(wav_tap_close);
+    }
+    if (!g_wav || !samples || num_samples <= 0)
+        return;
+    n = (size_t)num_samples * WAV_CHANNELS;
+    g_wav_bytes += (long)fwrite(samples, sizeof(int16_t), n, g_wav);
+    if ((g_wav_bytes & 0xFFFF) < (long)num_samples * WAV_CHANNELS)
+        fflush(g_wav);
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
@@ -365,6 +453,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     int queued, max_queued;
     uint32_t u;
+
+    wav_tap(samples, num_samples);
 
     if (!g_web_on) return 0;
     if (num_samples > XA2_BUF_SAMPLES) num_samples = XA2_BUF_SAMPLES;
