@@ -265,6 +265,12 @@ void xbox_FramebufferSnapshot(const char *path)
     (void)xbox_FramebufferDumpBmp(path);
 }
 
+/* No overlay in this presenter: the message goes to the console. */
+void xbox_FramebufferOsd(const char *text)
+{
+    fprintf(stderr, "  [FBWIN] %s\n", text ? text : "");
+}
+
 void xbox_FramebufferWindowStart(void)
 {
     if (!getenv("RECOMP_FB_WINDOW"))

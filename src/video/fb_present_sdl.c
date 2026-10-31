@@ -568,4 +568,10 @@ void xbox_FramebufferWindowRunHere(void)
 }
 #endif
 
+/* No overlay in this presenter: the message goes to the log. */
+void xbox_FramebufferOsd(const char *text)
+{
+    fprintf(stderr, "  [FBWIN] %s\n", text ? text : "");
+}
+
 #endif /* !_WIN32 */

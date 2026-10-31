@@ -388,38 +388,44 @@ static const unsigned char *glyph(char ch)
         {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
         {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}};
     static const struct { char c; unsigned char rows[7]; } g_letters[] = {
-        {'F', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}}, {'P', {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
-        {'S', {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}}, {'H', {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}},
-        {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, {'W', {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}},
-        {'N', {0x11,0x19,0x15,0x13,0x11,0x11,0x11}}, {'M', {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}},
-        {'A', {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}}, {'X', {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}},
+        {'A', {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}}, {'B', {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}},
+        {'C', {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}}, {'D', {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}},
+        {'E', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}}, {'F', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}},
+        {'G', {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}}, {'H', {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}},
+        {'I', {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}}, {'J', {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}},
+        {'K', {0x11,0x12,0x14,0x18,0x14,0x12,0x11}}, {'L', {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}},
+        {'M', {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, {'N', {0x11,0x19,0x15,0x13,0x11,0x11,0x11}},
+        {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}}, {'P', {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
+        {'Q', {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}}, {'R', {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}},
+        {'S', {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}}, {'T', {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}},
+        {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}}, {'V', {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}},
+        {'W', {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}}, {'X', {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}},
+        {'Y', {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}}, {'Z', {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}},
+        {'(', {0x02,0x04,0x08,0x08,0x08,0x04,0x02}}, {')', {0x08,0x04,0x02,0x02,0x02,0x04,0x08}},
         {'.', {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}}};
     size_t i;
     if (ch >= '0' && ch <= '9')
         return g_digits[ch - '0'];
+    if (ch >= 'a' && ch <= 'z')
+        ch = (char)(ch - 'a' + 'A');
     for (i = 0; i < sizeof g_letters / sizeof g_letters[0]; i++)
         if (g_letters[i].c == ch)
             return g_letters[i].rows;
     return NULL;                        /* space */
 }
 
-static void fps_overlay_draw(uint32_t *px, uint32_t w, uint32_t h)
+/* One line of text in a darkened box at (x0, y0), sc pixels per font pixel. */
+static void overlay_text(uint32_t *px, uint32_t w, uint32_t h, const char *text,
+                         int x0, int y0, int sc)
 {
-    char text[48];
-    int sc = (int)(h / 240u), len, i, x0, y0, bw, bh, x, y;
-    if (!fps_overlay_on() || !px || w < 64 || h < 32)
-        return;
-    memcpy(text, s_overlay_text, sizeof text);
-    text[sizeof text - 1] = 0;
-    len = (int)strlen(text);
-    if (!len)
+    int len = (int)strlen(text), i, bw, bh, x, y;
+    if (!len || !px || w < 64 || h < 32)
         return;
     if (sc < 2) sc = 2;
-    x0 = sc * 3; y0 = sc * 3;
     bw = (len * 6 + 2) * sc; bh = 10 * sc;
     if (x0 + bw > (int)w) bw = (int)w - x0;
     for (y = y0; y < y0 + bh && y < (int)h; y++)      /* darkened box */
-        for (x = x0; x < x0 + bw; x++) {
+        for (x = x0; x < x0 + bw && x < (int)w; x++) {
             uint32_t p = px[(size_t)y * w + x];
             px[(size_t)y * w + x] = (p >> 2) & 0x3F3F3F;
         }
@@ -435,6 +441,46 @@ static void fps_overlay_draw(uint32_t *px, uint32_t w, uint32_t h)
                         for (x = gx + cx * sc; x < gx + (cx + 1) * sc && x < (int)w; x++)
                             px[(size_t)y * w + x] = 0xFFFFFF;
     }
+}
+
+static void fps_overlay_draw(uint32_t *px, uint32_t w, uint32_t h)
+{
+    char text[48];
+    int sc = (int)(h / 240u);
+    if (!fps_overlay_on() || !px || w < 64 || h < 32)
+        return;
+    if (sc < 2) sc = 2;
+    memcpy(text, s_overlay_text, sizeof text);
+    text[sizeof text - 1] = 0;
+    overlay_text(px, w, h, text, sc * 3, sc * 3, sc);
+}
+
+/* xbox_FramebufferOsd: a short message under the FPS line for a few seconds
+ * (a setting changed with a key). Drawn whether or not the FPS overlay is up,
+ * so the feedback does not depend on it. */
+static char s_osd_text[64];
+static volatile LONG s_osd_until;
+
+void xbox_FramebufferOsd(const char *text)
+{
+    snprintf(s_osd_text, sizeof s_osd_text, "%s", text ? text : "");
+    InterlockedExchange(&s_osd_until, (LONG)GetTickCount() + 3000);
+}
+
+static void osd_draw(uint32_t *px, uint32_t w, uint32_t h)
+{
+    char text[64];
+    int sc = (int)(h / 240u);
+    if (!px || w < 64 || h < 32)
+        return;
+    if ((LONG)GetTickCount() > s_osd_until)
+        return;
+    if (sc < 2) sc = 2;
+    memcpy(text, s_osd_text, sizeof text);
+    text[sizeof text - 1] = 0;
+    if (!text[0])
+        return;
+    overlay_text(px, w, h, text, sc * 3, sc * 12, sc);   /* under the FPS line */
 }
 
 /* Once a second from the window thread: the overlay's numbers, and with
@@ -881,6 +927,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 LONG k = s_hi_front;
                 double tw0 = pres_now_ms(), tw1;
                 fps_overlay_draw(s_hi[k], s_hi_w[k], s_hi_h[k]);
+                osd_draw(s_hi[k], s_hi_w[k], s_hi_h[k]);
                 xbox_UiDraw(s_hi[k], s_hi_w[k], s_hi_h[k]);
                 if (s_seq_want)
                     seq_frame(s_hi[k], s_hi_w[k], s_hi_h[k]);
@@ -906,6 +953,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             xbox_FramebufferApplyGamma(s_rgb, (size_t)s_fb_width * s_fb_height);
             if (gpu_present_active()) {
                 fps_overlay_draw(s_rgb, s_fb_width, s_fb_height);
+                osd_draw(s_rgb, s_fb_width, s_fb_height);
                 xbox_UiDraw(s_rgb, s_fb_width, s_fb_height);
                 if (!gpu_present_frame_size(s_rgb, s_fb_width, s_fb_height))  /* vsync-paced, unless occluded */
                     Sleep(16);
