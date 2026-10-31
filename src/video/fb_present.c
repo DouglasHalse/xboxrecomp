@@ -23,6 +23,9 @@ void xbox_FramebufferApplyGamma(uint32_t *px, size_t n);   /* fb_gamma.c */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wincodec.h>
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 #include "gpu_present.h"
 #include "ui_overlay.h"
 
@@ -673,11 +676,110 @@ int xbox_FramebufferDumpBmp(const char *path)
 }
 
 
+/* The frame the window is showing, copied out: a renderer's published frame
+ * when there is a current one (gamma applied as on screen), else the guest
+ * framebuffer. Caller frees. */
+static uint32_t *grab_frame(uint32_t *w_out, uint32_t *h_out)
+{
+    LONG k = s_hi_front;
+    uint32_t *copy;
+    if (s_hi_have && (LONG)GetTickCount() - s_hi_tick < 500) {
+        size_t n = (size_t)s_hi_w[k] * s_hi_h[k];
+        copy = (uint32_t *)malloc(n * 4);
+        if (copy) {
+            memcpy(copy, s_hi[k], n * 4);
+            xbox_FramebufferApplyGamma(copy, n);
+            *w_out = s_hi_w[k];
+            *h_out = s_hi_h[k];
+            return copy;
+        }
+    }
+    if (!s_rgb)
+        return NULL;
+    copy = (uint32_t *)malloc((size_t)s_fb_width * s_fb_height * 4);
+    if (!copy)
+        return NULL;
+    memcpy(copy, s_rgb, (size_t)s_fb_width * s_fb_height * 4);
+    *w_out = s_fb_width;
+    *h_out = s_fb_height;
+    return copy;
+}
+
+static int path_is_png(const char *p)
+{
+    size_t n = p ? strlen(p) : 0;
+    return n > 4 && _stricmp(p + n - 4, ".png") == 0;
+}
+
+/* PNG through WIC, the encoder Windows ships: compressing 2560x1440 takes a
+ * moment, and the caller is an input thread rather than the one presenting. */
+static int write_png(const char *path, const uint32_t *pix, uint32_t w, uint32_t h)
+{
+    IWICImagingFactory *fact = NULL;
+    IWICStream *stream = NULL;
+    IWICBitmapEncoder *enc = NULL;
+    IWICBitmapFrameEncode *frame = NULL;
+    IPropertyBag2 *props = NULL;
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    wchar_t wide[512];
+    int ok = -1;
+
+    if (!MultiByteToWideChar(CP_ACP, 0, path, -1, wide, (int)(sizeof wide / sizeof wide[0])))
+        return -1;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                                &IID_IWICImagingFactory, (void **)&fact)) || !fact)
+        goto done;
+    if (FAILED(fact->lpVtbl->CreateStream(fact, &stream)) || !stream)
+        goto done;
+    if (FAILED(stream->lpVtbl->InitializeFromFilename(stream, wide, GENERIC_WRITE)))
+        goto done;
+    if (FAILED(fact->lpVtbl->CreateEncoder(fact, &GUID_ContainerFormatPng, NULL, &enc)) || !enc)
+        goto done;
+    if (FAILED(enc->lpVtbl->Initialize(enc, (IStream *)stream, WICBitmapEncoderNoCache)))
+        goto done;
+    if (FAILED(enc->lpVtbl->CreateNewFrame(enc, &frame, &props)) || !frame)
+        goto done;
+    if (FAILED(frame->lpVtbl->Initialize(frame, props)))
+        goto done;
+    if (FAILED(frame->lpVtbl->SetSize(frame, w, h)))
+        goto done;
+    if (FAILED(frame->lpVtbl->SetPixelFormat(frame, &fmt)))
+        goto done;
+    if (FAILED(frame->lpVtbl->WritePixels(frame, h, w * 4, w * h * 4, (BYTE *)pix)))
+        goto done;
+    if (FAILED(frame->lpVtbl->Commit(frame)))
+        goto done;
+    if (FAILED(enc->lpVtbl->Commit(enc)))
+        goto done;
+    ok = 0;
+done:
+    if (props) props->lpVtbl->Release(props);
+    if (frame) frame->lpVtbl->Release(frame);
+    if (enc) enc->lpVtbl->Release(enc);
+    if (stream) stream->lpVtbl->Release(stream);
+    if (fact) fact->lpVtbl->Release(fact);
+    return ok;
+}
+
 /* The frame the window is showing, for the title's own diagnostics (SSX 3
- * takes one for its player mark). The Windows/D3D11 presenter shows one frame at a time, so this
- * is the same image its dump entry point writes. */
+ * takes one for its player mark). The path decides the format; a PNG that
+ * cannot be written falls back to the BMP writer. */
 void xbox_FramebufferSnapshot(const char *path)
 {
+    uint32_t w = 0, h = 0, *pix;
+
+    if (path && path_is_png(path)) {
+        pix = grab_frame(&w, &h);
+        if (pix) {
+            int rc = write_png(path, pix, w, h);
+            free(pix);
+            if (rc == 0) {
+                fprintf(stderr, "  [FBWIN] wrote %s (%ux%u, png)\n", path, w, h);
+                return;
+            }
+        }
+    }
     (void)xbox_FramebufferDumpBmp(path);
 }
 
