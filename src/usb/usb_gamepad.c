@@ -12,6 +12,7 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "../video/ui_overlay.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -614,6 +615,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
+
+    /* A port screen (its options menu) owns the pads while it is up: the
+     * title keeps polling the device and must see an untouched controller. */
+    if (xbox_UiBlocksInput())
+        return 20;
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */

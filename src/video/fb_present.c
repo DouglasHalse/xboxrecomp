@@ -24,6 +24,7 @@ void xbox_FramebufferApplyGamma(uint32_t *px, size_t n);   /* fb_gamma.c */
 #include <stdlib.h>
 #include <string.h>
 #include "gpu_present.h"
+#include "ui_overlay.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -292,6 +293,8 @@ int xbox_FramebufferKeyDown(int vk)
 {
     if ((unsigned)vk > 255)
         return 0;
+    if (xbox_UiBlocksInput())
+        return 0;                       /* a port screen is up: keys are its own */
     return s_key_down[vk] != 0;
 }
 
@@ -367,6 +370,12 @@ static int fps_overlay_on(void)
         s_overlay = e && *e && *e != '0';
     }
     return s_overlay > 0;
+}
+
+/* A port's own options screen turns it on and off (ui_overlay.h). */
+void xbox_FramebufferSetFpsOverlay(int on)
+{
+    InterlockedExchange(&s_overlay, on ? 1 : 0);
 }
 
 /* 5x7 glyphs, one byte per row, bit 4 = leftmost column. */
@@ -446,6 +455,11 @@ static void present_second(LONG flips_delta, LONG shown, LONG loops, double work
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* A port screen gets the keys first, and a key it takes is not remembered
+     * for the pad stand-in either -- otherwise navigating the menu also moves
+     * the title's own menu. */
+    if ((m == WM_KEYDOWN || m == WM_KEYUP) && xbox_UiKey((int)w, m == WM_KEYDOWN))
+        return 0;
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
         || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
         fb_toggle_fullscreen(h);
@@ -867,6 +881,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 LONG k = s_hi_front;
                 double tw0 = pres_now_ms(), tw1;
                 fps_overlay_draw(s_hi[k], s_hi_w[k], s_hi_h[k]);
+                xbox_UiDraw(s_hi[k], s_hi_w[k], s_hi_h[k]);
                 if (s_seq_want)
                     seq_frame(s_hi[k], s_hi_w[k], s_hi_h[k]);
                 tw1 = pres_now_ms();
@@ -891,6 +906,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             xbox_FramebufferApplyGamma(s_rgb, (size_t)s_fb_width * s_fb_height);
             if (gpu_present_active()) {
                 fps_overlay_draw(s_rgb, s_fb_width, s_fb_height);
+                xbox_UiDraw(s_rgb, s_fb_width, s_fb_height);
                 if (!gpu_present_frame_size(s_rgb, s_fb_width, s_fb_height))  /* vsync-paced, unless occluded */
                     Sleep(16);
             }

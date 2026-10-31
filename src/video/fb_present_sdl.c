@@ -8,6 +8,7 @@
 #if !defined(_WIN32)
 #define _GNU_SOURCE
 #include <SDL2/SDL.h>
+#include "ui_overlay.h"
 #if defined(__ANDROID__)
 #include "touch_pad.h"
 #endif
@@ -34,6 +35,9 @@ static volatile int  s_flips, s_frame_draws;
 
 /* The window's client area in pixels (see fb_present.c). */
 static volatile int s_client_w, s_client_h;
+
+/* No frame counter in this presenter; the port's setting is still accepted. */
+void xbox_FramebufferSetFpsOverlay(int on) { (void)on; }
 
 int xbox_FramebufferClientSize(int *w, int *h)
 {
@@ -401,10 +405,24 @@ static void *fb_thread(void *unused)
             } else if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
                        e.type == SDL_FINGERUP || e.type == SDL_MOUSEBUTTONDOWN ||
                        e.type == SDL_MOUSEBUTTONUP || e.type == SDL_MOUSEMOTION) {
+                /* A port screen takes fingers in window pixels; the pad it
+                 * hides underneath would read the same tap in its own space. */
+                if (e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
+                    e.type == SDL_FINGERUP) {
+                    int ww = 0, wh = 0;
+                    SDL_GetWindowSize(win, &ww, &wh);
+                    if (ww > 0 && wh > 0
+                        && xbox_UiTouch(e.tfinger.x * (float)ww, e.tfinger.y * (float)wh,
+                                        e.type == SDL_FINGERDOWN ? 0
+                                        : e.type == SDL_FINGERUP ? 2 : 1))
+                        continue;
+                }
                 touch_pad_event(&e, ren);
 #endif
             } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 int vk = sdl_to_vk(e.key.keysym.sym);
+                if (vk && xbox_UiKey(vk, e.type == SDL_KEYDOWN))
+                    continue;
                 /* RECOMP_KEY_TRACE: each key as it arrives, as in fb_present.c,
                  * with SDL's name for it -- tells "never reached the window"
                  * (a desktop shortcut or media key) from "arrived unmapped". */
@@ -454,12 +472,14 @@ static void *fb_thread(void *unused)
             if (hi_tex && hi_rgb) {
                 if (fresh) {
                     xbox_FramebufferApplyGamma(hi_rgb, (size_t)hi_w * hi_h);
+                    xbox_UiDraw(hi_rgb, hi_w, hi_h);
                     SDL_UpdateTexture(hi_tex, NULL, hi_rgb, (int)(hi_w * 4));
                 }
                 SDL_RenderClear(ren);
                 SDL_RenderCopy(ren, hi_tex, NULL, NULL);
 #if defined(__ANDROID__)
-                touch_pad_render(ren);
+                if (!xbox_UiBlocksInput())
+                    touch_pad_render(ren);
 #endif
                 SDL_RenderPresent(ren);
                 snap_trigger_poll(hi_rgb, hi_w, hi_h);
@@ -486,11 +506,13 @@ static void *fb_thread(void *unused)
                                s_fb_pitch / s_fb_width);
         }
         xbox_FramebufferApplyGamma(s_rgb, (size_t)s_fb_width * s_fb_height);
+        xbox_UiDraw(s_rgb, s_fb_width, s_fb_height);
         SDL_UpdateTexture(tex, NULL, s_rgb, (int)(s_fb_width * 4));
         SDL_RenderClear(ren);
         SDL_RenderCopy(ren, tex, NULL, NULL);
 #if defined(__ANDROID__)
-        touch_pad_render(ren);
+        if (!xbox_UiBlocksInput())
+            touch_pad_render(ren);
 #endif
         SDL_RenderPresent(ren);
         snap_trigger_poll(NULL, 0, 0);

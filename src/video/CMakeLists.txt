@@ -5,6 +5,7 @@ add_library(xbox_video STATIC
     fb_present.c
     fb_gamma.c
     gpu_present.c
+    ui_overlay.c
 )
 if(EMSCRIPTEN)
     target_sources(xbox_video PRIVATE fb_present_web.c)
