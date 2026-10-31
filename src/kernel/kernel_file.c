@@ -16,6 +16,8 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "kernel_iso.h"
+#include "platform/win32_compat.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <dirent.h>
@@ -873,6 +876,56 @@ static int file_trace(void)
  * until its directory handle closes (see the note there). */
 static void dir_context_release(HANDLE h);
 
+#if !defined(_WIN32)
+/* ---- game files that live inside the APK -------------------------------- */
+
+/* kernel_iso.c owns the image; the platform layer owns the handle. These four
+ * functions are the bridge, installed on first use, so a bundled build reads
+ * its disc in place while an imported tree keeps working unchanged. */
+static int disc_open(const char *host_path)
+{
+    if (!xbox_iso_ready(xbox_game_dir()))
+        return -1;
+    if (xbox_iso_is_dir(host_path))
+        return -2;
+    return xbox_iso_open(host_path);
+}
+
+static long long disc_read(int file, void *buf, long long n, long long off)
+{
+    return (long long)xbox_iso_pread(file, buf, (size_t)n, (uint64_t)off);
+}
+
+static long long disc_size(int file)
+{
+    return (long long)xbox_iso_handle_size(file);
+}
+
+static void disc_close(int file)
+{
+    xbox_iso_close(file);
+}
+
+static void iso_prepare(void)
+{
+    static int installed;
+    static const w32_disc_backend backend = { disc_open, disc_read, disc_size, disc_close };
+
+    if (!installed) {
+        w32_set_disc_backend(&backend);
+        installed = 1;
+    }
+    xbox_iso_ready(xbox_game_dir());
+}
+
+/* A handle the file layer can work with: a local file, or a file or
+ * directory that came out of the image. */
+static int handle_ok(HANDLE h)
+{
+    return w32_handle_is_file(h) || w32_handle_is_disc(h);
+}
+#endif
+
 /* Resolve OBJECT_ATTRIBUTES to a host path.
  *
  * NT names may be relative to a directory handle (ObjectAttributes->
@@ -947,6 +1000,26 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     if (fd < 0) {
+        /* Not on the host filesystem: a bundled build keeps the game's own
+         * files inside the APK and serves them read-only from the mounted
+         * image. Nothing that can write is ever taken from there. */
+        if (!file_access_writes(DesiredAccess)) {
+            iso_prepare();
+            HANDLE disc = w32_open_disc(host_path);
+            if (disc) {
+                *FileHandle = disc;
+                dir_context_release(*FileHandle);
+                if (xbox_file_hook)
+                    xbox_file_hook(xbox_path, 0, (int32_t)STATUS_SUCCESS);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_SUCCESS;
+                    IoStatusBlock->Information = 1;
+                }
+                XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> image handle=%p",
+                           host_path, *FileHandle);
+                return STATUS_SUCCESS;
+            }
+        }
         int e = errno;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
         fprintf(stderr, "  [FILE] host open '%s' failed: %s\n", host_path, strerror(e));
@@ -989,16 +1062,15 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
-    int fd = w32_handle_fd(FileHandle);
-    if (fd < 0) {
+    if (!handle_ok(FileHandle)) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
     }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+        w32_file_seek(FileHandle, (int64_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = read(fd, Buffer, Length);
+    ssize_t n = w32_file_read(FileHandle, Buffer, Length);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1025,16 +1097,15 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
-    int fd = w32_handle_fd(FileHandle);
-    if (fd < 0) {
+    if (!handle_ok(FileHandle)) {
         IoStatusBlock->Status = STATUS_INVALID_HANDLE;
         return STATUS_INVALID_HANDLE;
     }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0)
-        lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+        w32_file_seek(FileHandle, (int64_t)ByteOffset->QuadPart, SEEK_SET);
 
-    ssize_t n = write(fd, Buffer, Length);
+    ssize_t n = w32_file_write(FileHandle, Buffer, Length);
     if (n < 0) {
         const char *hp = w32_handle_path(FileHandle);
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
@@ -1081,6 +1152,13 @@ NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     if (!xbox_path || !xbox_translate_obj_path(ObjectAttributes, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
     XBOX_TRACE(XBOX_LOG_FILE, "NtDeleteFile: %s", host_path);
+    iso_prepare();
+    if (xbox_iso_find(host_path) >= 0) {
+        /* Read-only by design: the image is the disc, not a scratch copy. */
+        if (file_trace())
+            fprintf(stderr, "  [FILE-T] delete '%s' refused (image)\n", host_path);
+        return STATUS_ACCESS_DENIED;
+    }
     if (unlink(host_path) == 0) {
         if (file_trace() && (strstr(host_path, "UDATA") || strstr(host_path, "TDATA")))
             fprintf(stderr, "  [FILE-T] delete '%s' (file)\n", host_path);
@@ -1104,8 +1182,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
-    int fd = w32_handle_fd(FileHandle);
-    if (fd < 0)
+    if (!handle_ok(FileHandle))
         return STATUS_INVALID_HANDLE;
 
     if (file_trace()) {
@@ -1116,7 +1193,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
-        if (fstat(fd, &st) != 0)
+        if (w32_file_stat(FileHandle, &st) != 0)
             return STATUS_UNSUCCESSFUL;
     }
 
@@ -1145,7 +1222,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            off_t pos = lseek(fd, 0, SEEK_CUR);
+            int64_t pos = w32_file_seek(FileHandle, 0, SEEK_CUR);
             if (pos < 0) return STATUS_UNSUCCESSFUL;
             info->CurrentByteOffset.QuadPart = pos;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1180,8 +1257,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
-    int fd = w32_handle_fd(FileHandle);
-    if (fd < 0)
+    if (!handle_ok(FileHandle))
         return STATUS_INVALID_HANDLE;
 
     if (file_trace()) {
@@ -1193,14 +1269,16 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
+            if (w32_file_seek(FileHandle, info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
         case XboxFileEndOfFileInformation: {
             PXBOX_FILE_END_OF_FILE_INFORMATION info = (PXBOX_FILE_END_OF_FILE_INFORMATION)FileInformation;
-            if (ftruncate(fd, (off_t)info->EndOfFile.QuadPart) != 0)
+            if (w32_handle_is_disc(FileHandle))
+                return STATUS_ACCESS_DENIED;      /* the image is the disc */
+            if (ftruncate(w32_handle_fd(FileHandle), (off_t)info->EndOfFile.QuadPart) != 0)
                 return STATUS_UNSUCCESSFUL;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
@@ -1248,7 +1326,7 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
-            int fd = w32_handle_fd(FileHandle);
+            int fd = w32_handle_is_disc(FileHandle) ? -1 : w32_handle_fd(FileHandle);
             if (file_trace()) {
                 const char *hp = w32_handle_path(FileHandle);
                 if (hp && (strstr(hp, "UDATA") || strstr(hp, "TDATA")))
@@ -1281,9 +1359,13 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
 
 NTSTATUS __stdcall xbox_NtFlushBuffersFile(HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock)
 {
-    int fd = w32_handle_fd(FileHandle);
     int rc = -1;
-    if (fd >= 0) rc = fsync(fd);
+    if (w32_handle_is_disc(FileHandle)) {
+        rc = 0;                          /* nothing to flush: read-only image */
+    } else {
+        int fd = w32_handle_fd(FileHandle);
+        if (fd >= 0) rc = fsync(fd);
+    }
     if (file_trace()) {
         const char *hp = w32_handle_path(FileHandle);
         if (hp && (strstr(hp, "UDATA") || strstr(hp, "TDATA")))
@@ -1310,8 +1392,20 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (file_trace() && (strstr(host_path, "UDATA") || strstr(host_path, "TDATA")))
         fprintf(stderr, "  [FILE-T] attrs '%s'\n", host_path);
-    if (stat(host_path, &st) != 0)
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    if (stat(host_path, &st) != 0) {
+        /* Game files inside a bundled APK are not on the host filesystem. */
+        iso_prepare();
+        if (xbox_iso_find(host_path) < 0)
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        memset(&st, 0, sizeof st);
+        st.st_nlink = 1;
+        if (xbox_iso_is_dir(host_path)) {
+            st.st_mode = S_IFDIR | 0555;
+        } else {
+            st.st_mode = S_IFREG | 0444;
+            st.st_size = (off_t)xbox_iso_size(host_path);
+        }
+    }
 
     unix_to_filetime(st.st_ctime, 0, &FileInformation->CreationTime);
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);
@@ -1323,12 +1417,22 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     return STATUS_SUCCESS;
 }
 
-/* Directory enumeration state, keyed by the directory's Nt handle. */
+/* Directory enumeration state, keyed by the directory's Nt handle. A scan is
+ * a snapshot taken when it starts: what the host directory holds, plus -- for
+ * a build whose game files live inside the APK -- what the mounted image
+ * holds. */
 #define MAX_DIR_CONTEXTS 64
 typedef struct {
     HANDLE handle;
-    DIR*   dir;
     char   pattern[64];
+    struct dir_ent {
+        char     name[256];
+        uint32_t size;
+        int64_t  mtime;
+        int      isdir;
+    }     *ent;                 /* snapshot; NULL when no scan is open */
+    int    count;
+    int    next;
 } DIR_CONTEXT;
 
 /* Case-insensitive glob for one path component, with the two '*' and '?'
@@ -1381,15 +1485,98 @@ static void dir_context_release(HANDLE h)
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
         if (s_dir_contexts[i].handle == h) {
-            if (s_dir_contexts[i].dir)
-                closedir(s_dir_contexts[i].dir);
-            s_dir_contexts[i].dir = NULL;
+            free(s_dir_contexts[i].ent);
+            s_dir_contexts[i].ent    = NULL;
+            s_dir_contexts[i].count  = 0;
+            s_dir_contexts[i].next   = 0;
             s_dir_contexts[i].handle = NULL;
             s_dir_contexts[i].pattern[0] = '\0';
             break;
         }
     }
     LeaveCriticalSection(&s_dir_cs);
+}
+
+#define DIR_SCAN_MAX 512
+
+static int dir_scan_add(DIR_CONTEXT *ctx, const char *name, uint32_t size,
+                        int64_t mtime, int isdir)
+{
+    int i;
+
+    if (ctx->count >= DIR_SCAN_MAX)
+        return -1;
+    if (strlen(name) >= sizeof ctx->ent[0].name)
+        return -1;
+    for (i = 0; i < ctx->count; i++)
+        if (!strcasecmp(ctx->ent[i].name, name))
+            return 0;                 /* the host's copy of a name wins */
+    snprintf(ctx->ent[ctx->count].name, sizeof ctx->ent[0].name, "%s", name);
+    ctx->ent[ctx->count].size  = size;
+    ctx->ent[ctx->count].mtime = mtime;
+    ctx->ent[ctx->count].isdir = isdir;
+    ctx->count++;
+    return 0;
+}
+
+typedef struct {
+    DIR_CONTEXT *ctx;
+    const char  *pattern;
+} dir_scan_state;
+
+static void dir_scan_image_ent(void *user, const char *name, uint64_t size, int isdir)
+{
+    dir_scan_state *st = (dir_scan_state *)user;
+
+    if (dir_glob_match(st->pattern, name))
+        dir_scan_add(st->ctx, name, (uint32_t)size, 0, isdir);
+}
+
+/* Build the snapshot for one scan. Host entries are added first, so a file the
+ * title wrote over a name the image also carries still reads back its own
+ * bytes; image entries follow and never replace one. 0 when the directory
+ * exists in either place. */
+static int dir_scan_build(DIR_CONTEXT *ctx, const char *path)
+{
+    DIR *d;
+    struct dirent *de;
+    dir_scan_state st;
+    int any = 0;
+
+    free(ctx->ent);
+    ctx->ent = (struct dir_ent *)calloc(DIR_SCAN_MAX, sizeof *ctx->ent);
+    ctx->count = 0;
+    ctx->next  = 0;
+    if (!ctx->ent)
+        return -1;
+
+    d = opendir(path);
+    if (d) {
+        any = 1;
+        while ((de = readdir(d)) != NULL) {
+            char full[MAX_PATH];
+            struct stat sb;
+
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+                continue;
+            if (!dir_glob_match(ctx->pattern, de->d_name))
+                continue;
+            memset(&sb, 0, sizeof sb);
+            snprintf(full, sizeof full, "%s/%s", path, de->d_name);
+            if (stat(full, &sb) != 0)
+                memset(&sb, 0, sizeof sb);
+            dir_scan_add(ctx, de->d_name, (uint32_t)sb.st_size, (int64_t)sb.st_mtime,
+                         S_ISDIR(sb.st_mode));
+        }
+        closedir(d);
+    }
+
+    iso_prepare();
+    st.ctx     = ctx;
+    st.pattern = ctx->pattern;
+    if (xbox_iso_list(path, dir_scan_image_ent, &st) > 0)
+        any = 1;
+    return any ? 0 : -1;
 }
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
@@ -1434,20 +1621,13 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         ctx->handle = FileHandle;
-        ctx->dir = NULL;
+        ctx->ent    = NULL;
     }
 
-    if (RestartScan || ctx->dir == NULL ||
+    if (RestartScan || ctx->ent == NULL ||
         (FileName && FileName->Buffer && FileName->Length > 0)) {
-        if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);
         if (!dpath) { LeaveCriticalSection(&s_dir_cs); return STATUS_UNSUCCESSFUL; }
-        ctx->dir = opendir(dpath);
-        if (!ctx->dir) {
-            LeaveCriticalSection(&s_dir_cs);
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
-        }
         if (FileName && FileName->Buffer && FileName->Length > 0) {
             USHORT n = FileName->Length;
             if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
@@ -1456,59 +1636,52 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         } else {
             strcpy(ctx->pattern, "*");
         }
-    }
-
-    /* Advance to the next entry matching the search pattern. */
-    struct dirent* de;
-    const char* dpath = w32_handle_path(FileHandle);
-    struct stat st;
-    for (;;) {
-        de = readdir(ctx->dir);
-        if (!de) {
-            closedir(ctx->dir);
-            ctx->dir = NULL;
-            ctx->handle = NULL;
+        if (dir_scan_build(ctx, dpath) != 0) {
             LeaveCriticalSection(&s_dir_cs);
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
-            continue;
-        if (dir_glob_match(ctx->pattern, de->d_name)) {
-            if (file_trace()) {
-                const char *dp = w32_handle_path(FileHandle);
-                if (dp && (strstr(dp, "UDATA") || strstr(dp, "TDATA")))
-                    fprintf(stderr, "  [FILE-T] list '%s' pat='%s' -> '%s'\n",
-                            dp, ctx->pattern, de->d_name);
-            }
-            break;
-        }
     }
 
-    char full[MAX_PATH];
-    snprintf(full, sizeof(full), "%s/%s", dpath ? dpath : ".", de->d_name);
-    if (stat(full, &st) != 0)
-        memset(&st, 0, sizeof(st));
+    if (ctx->next >= ctx->count) {
+        LeaveCriticalSection(&s_dir_cs);
+        IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+        return STATUS_NO_MORE_FILES;
+    }
+
+    struct dir_ent* e = &ctx->ent[ctx->next++];
+    if (file_trace()) {
+        const char *dp = w32_handle_path(FileHandle);
+        if (dp && (strstr(dp, "UDATA") || strstr(dp, "TDATA")))
+            fprintf(stderr, "  [FILE-T] list '%s' pat='%s' -> '%s'\n",
+                    dp, ctx->pattern, e->name);
+    }
+    uint32_t ent_size = e->size;
+    int64_t  ent_time = e->mtime;
+    int      ent_dir  = e->isdir;
+    char     ent_name[256];
+    memcpy(ent_name, e->name, sizeof ent_name);
     LeaveCriticalSection(&s_dir_cs);
 
     PXBOX_FILE_DIRECTORY_INFORMATION entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
 
-    int name_len = (int)strlen(de->d_name);
+    int name_len = (int)strlen(ent_name);
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
-    unix_to_filetime(st.st_ctime, 0, &entry->CreationTime);
-    unix_to_filetime(st.st_atime, 0, &entry->LastAccessTime);
-    unix_to_filetime(st.st_mtime, 0, &entry->LastWriteTime);
+    unix_to_filetime((time_t)ent_time, 0, &entry->CreationTime);
+    unix_to_filetime((time_t)ent_time, 0, &entry->LastAccessTime);
+    unix_to_filetime((time_t)ent_time, 0, &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
-    entry->EndOfFile.QuadPart = st.st_size;
-    entry->AllocationSize.QuadPart = (st.st_size + 4095) & ~4095LL;
-    entry->FileAttributes = mode_to_xbox_attrs(st.st_mode);
+    entry->EndOfFile.QuadPart = ent_size;
+    entry->AllocationSize.QuadPart = (ent_size + 4095) & ~4095LL;
+    entry->FileAttributes = ent_dir ? XBOX_FILE_ATTRIBUTE_DIRECTORY
+                                    : XBOX_FILE_ATTRIBUTE_NORMAL;
     entry->FileNameLength = name_len;
 
     ULONG header_size = (ULONG)((ULONG_PTR)&((PXBOX_FILE_DIRECTORY_INFORMATION)0)->FileName);
     if (name_len > 0 && (header_size + (ULONG)name_len) <= Length)
-        memcpy(entry->FileName, de->d_name, name_len);
+        memcpy(entry->FileName, ent_name, name_len);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = header_size + name_len;
     return STATUS_SUCCESS;

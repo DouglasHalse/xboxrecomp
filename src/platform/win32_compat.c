@@ -29,6 +29,7 @@
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
@@ -307,6 +308,11 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+    /* Bytes served from a mounted read-only image rather than from `fd`:
+     * >= 0 is a file in the image, -2 a directory that only exists there,
+     * -1 an ordinary host file. */
+    int             disc;
+    unsigned long long disc_pos;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -329,11 +335,25 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* ---- read-only image backend (kernel_iso.c) --------------------------- */
+
+static const w32_disc_backend *s_disc;
+
+void w32_set_disc_backend(const w32_disc_backend *backend) { s_disc = backend; }
+
+static void w32_disc_close(int file)
+{
+    if (s_disc && s_disc->close)
+        s_disc->close(file);
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
     o->kind     = kind;
     o->refcount = 1;
+    /* calloc leaves 0, which is a valid image file number. */
+    o->disc     = -1;
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
@@ -346,6 +366,7 @@ static void obj_release(w32_object *o)
         return;
     if (o->kind == K_FILE) {
         if (o->fd >= 0) close(o->fd);
+        if (o->disc >= 0) w32_disc_close(o->disc);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
@@ -377,6 +398,122 @@ const char *w32_handle_path(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
+}
+
+/* ---- file handles: local file, image file, or image directory --------- */
+
+HANDLE w32_open_disc(const char *host_path)
+{
+    w32_object *o;
+    int file;
+
+    if (!s_disc || !s_disc->open || !host_path)
+        return NULL;
+    file = s_disc->open(host_path);
+    if (file < 0 && file != -2)
+        return NULL;
+    o = obj_alloc(K_FILE);
+    o->fd        = -1;
+    o->disc      = file;
+    o->disc_pos  = 0;
+    o->file_path = strdup(host_path);
+    return (HANDLE)o;
+}
+
+int w32_handle_is_file(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    return o && o->kind == K_FILE && (o->fd >= 0 || o->disc >= 0);
+}
+
+int w32_handle_is_disc(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    return o && o->kind == K_FILE && o->disc != -1;
+}
+
+ssize_t w32_file_read(HANDLE h, void *buf, size_t len)
+{
+    w32_object *o = (w32_object *)h;
+    long long n;
+
+    if (!o || o->kind != K_FILE)
+        return -1;
+    if (o->disc == -1)
+        return read(o->fd, buf, len);
+    if (o->disc < 0 || !s_disc || !s_disc->read)
+        return -1;
+    n = s_disc->read(o->disc, buf, (long long)len, (long long)o->disc_pos);
+    if (n > 0)
+        o->disc_pos += (unsigned long long)n;
+    return (ssize_t)n;
+}
+
+ssize_t w32_file_write(HANDLE h, const void *buf, size_t len)
+{
+    w32_object *o = (w32_object *)h;
+
+    if (!o || o->kind != K_FILE || o->disc != -1)
+        return -1;                       /* the image is read-only */
+    return write(o->fd, buf, len);
+}
+
+int64_t w32_file_seek(HANDLE h, int64_t off, int whence)
+{
+    w32_object *o = (w32_object *)h;
+    int64_t base, size;
+
+    if (!o || o->kind != K_FILE)
+        return -1;
+    if (o->disc == -1)
+        return (int64_t)lseek(o->fd, (off_t)off, whence);
+    size = (s_disc && s_disc->size && o->disc >= 0) ? s_disc->size(o->disc) : 0;
+    switch (whence) {
+        case SEEK_SET: base = 0;                      break;
+        case SEEK_CUR: base = (int64_t)o->disc_pos;   break;
+        case SEEK_END: base = size;                   break;
+        default:       return -1;
+    }
+    if (base + off < 0)
+        return -1;
+    o->disc_pos = (unsigned long long)(base + off);
+    return (int64_t)o->disc_pos;
+}
+
+uint64_t w32_file_size(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    struct stat st;
+
+    if (!o || o->kind != K_FILE)
+        return ~0ull;
+    if (o->disc >= 0)
+        return (s_disc && s_disc->size) ? (uint64_t)s_disc->size(o->disc) : 0;
+    if (o->disc == -2)
+        return 0;
+    if (fstat(o->fd, &st) != 0)
+        return ~0ull;
+    return (uint64_t)st.st_size;
+}
+
+int w32_file_stat(HANDLE h, struct stat *st)
+{
+    w32_object *o = (w32_object *)h;
+
+    if (!o || o->kind != K_FILE || !st)
+        return -1;
+    if (o->disc == -1)
+        return fstat(o->fd, st);
+    memset(st, 0, sizeof *st);
+    if (o->disc == -2) {
+        st->st_mode  = S_IFDIR | 0555;
+        st->st_nlink = 2;
+    } else {
+        st->st_mode  = S_IFREG | 0444;
+        st->st_nlink = 1;
+        st->st_size  = (off_t)((s_disc && s_disc->size) ? s_disc->size(o->disc) : 0);
+    }
+    return 0;
 }
 
 BOOL CloseHandle(HANDLE h)
@@ -1388,7 +1525,18 @@ HANDLE CreateFileA(LPCSTR name, DWORD access, DWORD share,
     snprintf(norm, sizeof(norm), "%s", name);
     xbox_path_normalize(norm);
     int fd = open(norm, rw | extra, 0644);
-    if (fd < 0) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_HANDLE_VALUE; }
+    if (fd < 0) {
+        /* Not on the host: the game's own files may be inside a mounted
+         * image instead (kernel_iso.c). Read-only, so an open that wants to
+         * write is left failing. */
+        if (!(extra & (O_CREAT | O_TRUNC)) && rw == O_RDONLY) {
+            HANDLE disc = w32_open_disc(norm);
+            if (disc)
+                return disc;
+        }
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     return w32_open_handle(fd, name);
 }
 
@@ -1406,9 +1554,8 @@ HANDLE CreateFileW(LPCWSTR name, DWORD access, DWORD share,
 BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
 {
     (void)overlapped;
-    int fd = w32_handle_fd(h);
-    if (fd < 0) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ssize_t n = read(fd, buf, len);
+    if (!w32_handle_is_file(h)) { if (nread) *nread = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    ssize_t n = w32_file_read(h, buf, len);
     if (n < 0)  { if (nread) *nread = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nread)  *nread = (DWORD)n;
     return TRUE;
@@ -1417,9 +1564,8 @@ BOOL ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped)
 BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped)
 {
     (void)overlapped;
-    int fd = w32_handle_fd(h);
-    if (fd < 0) { if (nwritten) *nwritten = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ssize_t n = write(fd, buf, len);
+    if (!w32_handle_is_file(h)) { if (nwritten) *nwritten = 0; SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    ssize_t n = w32_file_write(h, buf, len);
     if (n < 0)  { if (nwritten) *nwritten = 0; SetLastError(ERROR_GEN_FAILURE);    return FALSE; }
     if (nwritten) *nwritten = (DWORD)n;
     return TRUE;
@@ -1427,29 +1573,28 @@ BOOL WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlap
 
 DWORD GetFileSize(HANDLE h, LPDWORD high)
 {
-    int fd = w32_handle_fd(h);
-    if (fd < 0) return INVALID_FILE_SIZE;
-    struct stat st;
-    if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
-    if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
-    return (DWORD)(st.st_size & 0xFFFFFFFFu);
+    uint64_t size = w32_file_size(h);
+    if (size == ~0ull)
+        return INVALID_FILE_SIZE;
+    if (high) *high = (DWORD)((size >> 32) & 0xFFFFFFFFu);
+    return (DWORD)(size & 0xFFFFFFFFu);
 }
 
 BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
 {
-    int fd = w32_handle_fd(h);
-    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    struct stat st;
-    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
-    size->QuadPart = (LONGLONG)st.st_size;
+    uint64_t bytes = w32_file_size(h);
+    if (bytes == ~0ull || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    size->QuadPart = (LONGLONG)bytes;
     return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)
 {
-    int fd = w32_handle_fd(h);
-    if (fd < 0) return FALSE;
-    return fsync(fd) == 0;
+    if (!w32_handle_is_file(h))
+        return FALSE;
+    if (w32_handle_is_disc(h))
+        return TRUE;                    /* nothing to flush: read-only image */
+    return fsync(w32_handle_fd(h)) == 0;
 }
 
 /* ===================================================================== */

@@ -559,6 +559,17 @@ const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/* The host directory game paths resolve under (kernel_path.c). NULL on a build
+ * that has no such notion. */
+const char *xbox_game_dir(void);
+
+/* Read a game file into memory, host copy first and the mounted image second
+ * (kernel_iso.c). 1 on success with a malloc'd buffer, 0 when neither has it. */
+int xbox_read_game_file(const char *host_path, void **data, size_t *size);
+
+/* 1 when the file is on the host or in the mounted image (kernel_iso.c). */
+int xbox_game_file_exists(const char *host_path);
+
 /* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the
  * path is translated, on the calling guest thread. Only paths a drive or

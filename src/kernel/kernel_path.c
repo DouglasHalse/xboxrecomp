@@ -843,4 +843,11 @@ translate:
     }
 }
 
+const char *xbox_game_dir(void)
+{
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    return s_game_dir;
+}
+
 #endif /* _WIN32 */

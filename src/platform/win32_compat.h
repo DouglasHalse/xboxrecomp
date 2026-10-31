@@ -128,6 +128,30 @@ HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 
+/* A read-only image can supply files that are not on the host filesystem
+ * (kernel_iso.c mounts a disc carried inside the APK). The kernel registers
+ * the reader; this layer only keeps the handle shape, so the file layer has
+ * one kind of file handle whether the bytes are local or in the image. */
+struct stat;    /* file-scope tag: a prototype's own scope would be a different type */
+
+typedef struct {
+    int       (*open)(const char *host_path);   /* >=0 file, -2 directory, -1 absent */
+    long long (*read)(int file, void *buf, long long n, long long off);
+    long long (*size)(int file);
+    void      (*close)(int file);
+} w32_disc_backend;
+
+void   w32_set_disc_backend(const w32_disc_backend *backend);
+HANDLE w32_open_disc(const char *host_path);    /* NULL when not in the image */
+int    w32_handle_is_file(HANDLE h);            /* real file or image file */
+int    w32_handle_is_disc(HANDLE h);
+
+ssize_t   w32_file_read(HANDLE h, void *buf, size_t len);
+ssize_t   w32_file_write(HANDLE h, const void *buf, size_t len);
+int64_t   w32_file_seek(HANDLE h, int64_t off, int whence);
+uint64_t  w32_file_size(HANDLE h);
+int       w32_file_stat(HANDLE h, struct stat *st);
+
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
 HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCWSTR name);
