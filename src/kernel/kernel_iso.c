@@ -27,6 +27,9 @@
  * exercise the parser on a host that has no pread(). */
 #include <io.h>
 #include <direct.h>
+#ifndef F_OK
+#define F_OK 0            /* MSVC spells it in <io.h> without the flag */
+#endif
 #define iso_strcasecmp _stricmp
 static long long iso_pread(int fd, void *buf, size_t n, long long off)
 {
@@ -442,6 +445,11 @@ static const char *absolute(const char *path, char *buf, size_t cap)
 #endif
     if (!getcwd(cwd, sizeof cwd))
         return NULL;
+    /* getcwd answers with the host's separators (backslashes on Windows); the
+     * mount point is spelled the way the app gives it, always with slashes. */
+    for (char *p = cwd; *p; p++)
+        if (*p == '\\')
+            *p = '/';
     if (snprintf(buf, cap, "%s/%s", cwd, path) >= (int)cap)
         return NULL;
     return buf;
@@ -553,13 +561,9 @@ int xbox_game_file_exists(const char *host_path)
 {
     if (!host_path || !host_path[0])
         return 0;
-#if !defined(_WIN32)
     if (access(host_path, F_OK) == 0)
         return 1;
     return xbox_iso_ready(xbox_game_dir()) && xbox_iso_find(host_path) >= 0;
-#else
-    return access(host_path, F_OK) == 0;
-#endif
 }
 
 int xbox_read_game_file(const char *host_path, void **data, size_t *size)

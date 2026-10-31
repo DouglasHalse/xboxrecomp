@@ -6,10 +6,11 @@
  * pieces), then walks the image and compares every file byte for byte with
  * the extracted tree it was made from.
  *
- *   iso_test <mount-dir> <tree> [/full]
+ *   iso_test <mount-dir> <tree> [/full] [image]
  *
- * <mount-dir> is a scratch directory that this writes .disc.mount into; the
- * image path comes from <mount-dir>/image.txt (first line, absolute path).
+ * <mount-dir> is a scratch directory this writes .disc.mount into. The image is
+ * the fourth argument when given (then it is remembered in
+ * <mount-dir>/image.txt), otherwise the first line of that file is used.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +26,16 @@
 
 static char s_mount[512];
 static char s_tree[512];
+
+/* kernel_iso.c asks the path layer where the game directory is; for this test
+ * the mount point is that directory. */
+const char *xbox_game_dir(void);
 static long long s_files, s_bytes, s_bad;
+
+const char *xbox_game_dir(void)
+{
+    return s_mount;
+}
 static int s_full;
 
 static int slurp(const char *path, unsigned char **out, long long *len)
@@ -150,17 +160,28 @@ int main(int argc, char **argv)
     s_full = argc > 3 && !strcmp(argv[3], "/full");
 
     snprintf(path, sizeof path, "%s/image.txt", s_mount);
-    f = fopen(path, "r");
-    if (!f) {
-        printf("cannot read %s\n", path);
-        return 2;
-    }
-    if (!fgets(line, sizeof line, f)) {
+    if (argc > 4 && argv[4][0]) {
+        f = fopen(path, "w");
+        if (!f) {
+            printf("cannot write %s\n", path);
+            return 2;
+        }
+        fprintf(f, "%s\n", argv[4]);
         fclose(f);
-        return 2;
+        snprintf(line, sizeof line, "%s", argv[4]);
+    } else {
+        f = fopen(path, "r");
+        if (!f) {
+            printf("cannot read %s (pass the image as the fourth argument)\n", path);
+            return 2;
+        }
+        if (!fgets(line, sizeof line, f)) {
+            fclose(f);
+            return 2;
+        }
+        fclose(f);
+        line[strcspn(line, "\r\n")] = '\0';
     }
-    fclose(f);
-    line[strcspn(line, "\r\n")] = '\0';
 
     fd = _open(line, _O_RDONLY | _O_BINARY);
     if (fd < 0) {

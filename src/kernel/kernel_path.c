@@ -505,6 +505,23 @@ translate:
     }
 }
 
+/* Same answer as the POSIX branch below, in the encoding the rest of the code
+ * speaks. Nothing on Windows mounts a disc image today, but xbox_iso.c asks for
+ * the directory on both platforms and a port may want it. */
+const char *xbox_game_dir(void)
+{
+    static char utf8[MAX_PATH];
+
+    if (!s_initialized)
+        xbox_path_init(NULL, NULL);
+    if (!WideCharToMultiByte(CP_UTF8, 0, s_game_dir, -1, utf8, sizeof utf8, NULL, NULL))
+        utf8[0] = '\0';
+    for (char *p = utf8; *p; p++)
+        if (*p == '\\')
+            *p = '/';
+    return utf8;
+}
+
 /* ======================================================================== */
 #else /* !_WIN32  -- POSIX / Linux */
 /* ======================================================================== */
