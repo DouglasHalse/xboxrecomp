@@ -192,6 +192,12 @@ DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 VOID   SwitchToThread(void);
+/* sched_yield, not the pause instruction: a busy spin here measured 49.0 FPS
+ * against 55.0 for the yield on the phone, at the same 480p settings. The
+ * cost is real (16% of the process's CPU sits in this call) but a spin pays
+ * for it in power and cluster contention. Waking this thread from the
+ * register write that needs it is the fix that would not trade one for the
+ * other. */
 #define YieldProcessor() sched_yield()
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 

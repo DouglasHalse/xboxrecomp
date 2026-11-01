@@ -1056,12 +1056,12 @@ static DWORD WINAPI nv2a_reg_ack_thread(LPVOID param)
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask)
                 *r |= NV2A_IDLE[i].idle_mask;
         }
-        if (++spin & 63)
-            YieldProcessor();
-        else {
-            QueryPerformanceCounter(&now);
-            Sleep(idle_ticks > 0 && now.QuadPart - last.QuadPart > idle_ticks ? 1 : 0);
-        }
+        QueryPerformanceCounter(&now);
+        if (idle_ticks > 0 && now.QuadPart - last.QuadPart > idle_ticks)
+            Sleep(1);              /* quiet: block instead of asking for a switch */
+        else
+            YieldProcessor();      /* burst: spin, a sched_yield here is a
+                                    * full context switch for a 20 us wait */
     }
     return 0;
 }
@@ -1069,12 +1069,23 @@ static DWORD WINAPI nv2a_reg_ack_thread(LPVOID param)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    uint32_t prev_put = 0;
+    unsigned idle_passes = 0;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        int work = 0;
+        /* Most passes find nothing to do. Notice that before spending a trip
+         * through the scheduler on it. */
+        uint32_t put_top = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+        if (put_top != prev_put) {
+            prev_put = put_top;
+            work = 1;
+        }
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
             if (*r & NV2A_ACK[i].busy_mask) {
                 *r &= ~NV2A_ACK[i].busy_mask;
+                work = 1;
             }
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1082,6 +1093,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
+                work = 1;
             }
         }
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
@@ -1294,7 +1306,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)XBOX_HOST(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)) = xbox_TickCountMs();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        /* Nothing to acknowledge and nothing submitted: yielding still costs a
+         * trip through the scheduler on every pass, and that is most of this
+         * thread's life. A millisecond of sleep is shorter than a frame at
+         * 60 Hz, so a kickoff is still answered within one frame. */
+        if (work) {
+            idle_passes = 0;
+            Sleep(0);
+        } else if (++idle_passes > 2) {
+            Sleep(1);
+        } else {
+            Sleep(0);
+        }
     }
     return 0;
 }

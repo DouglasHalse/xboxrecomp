@@ -10004,17 +10004,18 @@ void recomp_loop_yield(void)
     if (t_guest_held) {
         LONG gen = g_guest_gen;
         int waiting = fair_yield_on() && g_guest_waiters > 0;
-        t_guest_held = 0;
-        LeaveCriticalSection(&g_guest_cpu);
+        /* Nobody wants the CPU: keep it. Dropping and re-taking it here costs a
+         * sched_yield on every quantum -- a fifth of the guest's CPU time on the
+         * phone -- and buys a hand-over nobody asked for. */
         if (waiting) {
+            t_guest_held = 0;
+            LeaveCriticalSection(&g_guest_cpu);
             DWORD t0 = xbox_TickCountMs();
             while (g_guest_gen == gen && xbox_TickCountMs() - t0 < 5)
                 SwitchToThread();
-        } else {
-            SwitchToThread();
+            guest_cpu_acquire(prio_index(t_guest_prio));
+            t_guest_held = 1;
         }
-        guest_cpu_acquire(prio_index(t_guest_prio));
-        t_guest_held = 1;
     }
 }
 
