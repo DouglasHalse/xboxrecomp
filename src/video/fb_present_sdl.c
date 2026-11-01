@@ -36,6 +36,13 @@ static volatile int  s_flips, s_frame_draws;
 /* The window's client area in pixels (see fb_present.c). */
 static volatile int s_client_w, s_client_h;
 
+#if defined(__ANDROID__)
+# include <android/log.h>
+# define PRESENT_LOG(...) __android_log_print(ANDROID_LOG_INFO, "SSX3PERF", __VA_ARGS__)
+#else
+# define PRESENT_LOG(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
 /* FPS counter: RECOMP_FPS_OVERLAY=1 at launch, or a port's options screen
  * switching it on through xbox_FramebufferSetFpsOverlay(). The number is the
  * frames this presenter actually put on the screen, refreshed twice a second. */
@@ -122,6 +129,8 @@ static void fps_overlay_tick(double now)
         int f = s_flips;
         double fps = (f - s_fps_n0) * 1000.0 / (now - s_fps_t0);
         snprintf(s_fps_text, sizeof s_fps_text, "FPS %.0f", fps);
+        if (getenv("RECOMP_FPS_LOG"))
+            PRESENT_LOG("[FPS] %.1f\n", fps);
         s_fps_t0 = now;
         s_fps_n0 = f;
     }
