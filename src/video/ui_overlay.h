@@ -29,6 +29,16 @@ extern int (*volatile xbox_ui_touch)(float x, float y, int phase);
 /* 1 while the port's screen is up and the title must not see input. */
 extern int (*volatile xbox_ui_blocks_input)(void);
 
+/* The finished pad report, before the title reads it: a port screen inspects
+ * the buttons and returns 0 to swallow them (the report is neutralised, the
+ * device and its stick values stay). Called on the input thread. */
+extern int (*volatile xbox_ui_pad)(uint8_t *report, int len);
+
+/* The title's own pad state, on the path the title actually polls: `buttons`
+ * points at XINPUT_GAMEPAD.wButtons, `analog` at its eight pressure bytes.
+ * Return 0 to swallow the press (both are zeroed by the caller). */
+extern int (*volatile xbox_ui_buttons)(unsigned short *buttons, unsigned char *analog);
+
 /* The presenter's own frame counter (F3 on a desktop window), for a port that
  * offers it as a setting. A no-op where the presenter has none. */
 void xbox_FramebufferSetFpsOverlay(int on);

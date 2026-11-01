@@ -664,6 +664,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         out[2] = synth;
         pad_script_apply(pad, out);
         pad_touch_apply(pad, out);
+        xbox_UiPad(out, 20);
         return 20;
     }
 
@@ -682,5 +683,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
     pad_touch_apply(pad, out);
+    xbox_UiPad(out, 20);
     return 20;
 }

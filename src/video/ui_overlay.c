@@ -6,6 +6,8 @@ void (*volatile xbox_ui_draw)(uint32_t *px, uint32_t w, uint32_t h);
 int  (*volatile xbox_ui_key)(int vk, int down);
 int  (*volatile xbox_ui_touch)(float x, float y, int phase);
 int  (*volatile xbox_ui_blocks_input)(void);
+int  (*volatile xbox_ui_pad)(uint8_t *report, int len);
+int  (*volatile xbox_ui_buttons)(unsigned short *buttons, unsigned char *analog);
 
 void xbox_UiDraw(uint32_t *px, uint32_t w, uint32_t h)
 {
@@ -26,4 +28,11 @@ int xbox_UiTouch(float x, float y, int phase)
 int xbox_UiBlocksInput(void)
 {
     return xbox_ui_blocks_input ? xbox_ui_blocks_input() : 0;
+}
+
+int xbox_UiPad(uint8_t *report, int len)
+{
+    if (!xbox_ui_pad || !report || len < 20)
+        return 1;
+    return xbox_ui_pad(report, len);
 }

@@ -685,6 +685,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort == 0 && keyboard_enabled())
         keyboard_merge(pState);
+    if (dwPort == 0 && xbox_ui_buttons
+        && !xbox_ui_buttons(&pState->Gamepad.wButtons, pState->Gamepad.bAnalogButtons)) {
+        pState->Gamepad.wButtons = 0;
+        memset(pState->Gamepad.bAnalogButtons, 0, sizeof(pState->Gamepad.bAnalogButtons));
+    }
     return ERROR_SUCCESS;
 }
 
