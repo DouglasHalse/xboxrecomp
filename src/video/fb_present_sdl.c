@@ -36,8 +36,96 @@ static volatile int  s_flips, s_frame_draws;
 /* The window's client area in pixels (see fb_present.c). */
 static volatile int s_client_w, s_client_h;
 
-/* No frame counter in this presenter; the port's setting is still accepted. */
-void xbox_FramebufferSetFpsOverlay(int on) { (void)on; }
+/* FPS counter: RECOMP_FPS_OVERLAY=1 at launch, or a port's options screen
+ * switching it on through xbox_FramebufferSetFpsOverlay(). The number is the
+ * frames this presenter actually put on the screen, refreshed twice a second. */
+static volatile int s_fps_overlay = -1;
+static char  s_fps_text[16] = "FPS --";
+static double s_fps_t0, s_fps_n0;
+
+void xbox_FramebufferSetFpsOverlay(int on) { s_fps_overlay = on ? 1 : 0; }
+
+static int fps_overlay_on(void)
+{
+    if (s_fps_overlay < 0) {
+        const char *e = getenv("RECOMP_FPS_OVERLAY");
+        s_fps_overlay = e && *e && *e != '0';
+    }
+    return s_fps_overlay > 0;
+}
+
+/* 5x7 glyphs, bit 4 = leftmost column: the digits and the four letters the line
+ * needs, nothing else. */
+static const unsigned char *fps_glyph(char ch)
+{
+    static const unsigned char digits[10][7] = {
+        {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+        {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
+        {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+        {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+        {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}};
+    static const unsigned char F[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
+    static const unsigned char P[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10};
+    static const unsigned char S[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
+    static const unsigned char dot[7] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C};
+    if (ch >= '0' && ch <= '9') return digits[ch - '0'];
+    switch (ch) {
+    case 'F': return F;
+    case 'P': return P;
+    case 'S': return S;
+    case '.': return dot;
+    default:  return NULL;          /* space */
+    }
+}
+
+/* Text in a darkened box at the top left, scaled with the frame. */
+static void fps_overlay_draw(SDL_Renderer *ren, int w, int h)
+{
+    int sc = h / 200, i, x, y;
+    size_t len;
+    if (!ren || w < 64 || h < 64)
+        return;
+    if (sc < 2) sc = 2;
+    len = strlen(s_fps_text);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 150);
+    {
+        SDL_Rect box = { sc, sc, (int)(len * 6 * sc) + sc, 9 * sc };
+        SDL_RenderFillRect(ren, &box);
+    }
+    SDL_SetRenderDrawColor(ren, 235, 235, 235, 235);
+    for (i = 0; (size_t)i < len; i++) {
+        const unsigned char *g = fps_glyph(s_fps_text[i]);
+        int row;
+        if (!g)
+            continue;
+        for (row = 0; row < 7; row++) {
+            int col;
+            for (col = 0; col < 5; col++) {
+                SDL_Rect px;
+                if (!(g[row] & (1u << (4 - col))))
+                    continue;
+                px.x = (2 + i * 6 + col) * sc + sc;   /* + sc: inside the box */
+                px.y = (1 + row) * sc + sc;
+                px.w = px.h = sc;
+                SDL_RenderFillRect(ren, &px);
+            }
+        }
+    }
+}
+
+/* Called once a frame from the presenter: keeps the number moving. */
+static void fps_overlay_tick(double now)
+{
+    if (!s_fps_t0) { s_fps_t0 = now; s_fps_n0 = s_flips; return; }
+    if (now - s_fps_t0 >= 500.0) {
+        int f = s_flips;
+        double fps = (f - s_fps_n0) * 1000.0 / (now - s_fps_t0);
+        snprintf(s_fps_text, sizeof s_fps_text, "FPS %.0f", fps);
+        s_fps_t0 = now;
+        s_fps_n0 = f;
+    }
+}
 
 int xbox_FramebufferClientSize(int *w, int *h)
 {
@@ -481,6 +569,8 @@ static void *fb_thread(void *unused)
                 if (!xbox_UiBlocksInput())
                     touch_pad_render(ren);
 #endif
+                if (fps_overlay_on())
+                    fps_overlay_draw(ren, hi_w, hi_h);
                 SDL_RenderPresent(ren);
                 snap_trigger_poll(hi_rgb, hi_w, hi_h);
                 goto shown;
@@ -514,11 +604,14 @@ static void *fb_thread(void *unused)
         if (!xbox_UiBlocksInput())
             touch_pad_render(ren);
 #endif
+        if (fps_overlay_on())
+            fps_overlay_draw(ren, (int)s_fb_width, (int)s_fb_height);
         SDL_RenderPresent(ren);
         snap_trigger_poll(NULL, 0, 0);
 shown:
         {
             double now = now_ms();
+            fps_overlay_tick(now);
             if (now - t0 >= 1000.0) {
                 int f = s_flips;
                 char tb[128];
