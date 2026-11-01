@@ -48,5 +48,6 @@ void xbox_UiDraw(uint32_t *px, uint32_t w, uint32_t h);
 int  xbox_UiKey(int vk, int down);
 int  xbox_UiTouch(float x, float y, int phase);
 int  xbox_UiBlocksInput(void);
+int  xbox_UiPad(uint8_t *report, int len);
 
 #endif /* XBOX_UI_OVERLAY_H */

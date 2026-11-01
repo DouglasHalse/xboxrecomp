@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "../video/ui_overlay.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
