@@ -39,17 +39,17 @@
 #define FILL_R   90
 #define FILL_G   90
 #define FILL_B   90
-#define FILL_A   55
+#define FILL_A   72
 
-#define HELD_R  200
-#define HELD_G  200
-#define HELD_B  200
-#define HELD_A  105
+#define HELD_R  225
+#define HELD_G  225
+#define HELD_B  225
+#define HELD_A  140
 
-#define RING_R  215
-#define RING_G  215
-#define RING_B  215
-#define RING_A  105
+#define RING_R  235
+#define RING_G  235
+#define RING_B  235
+#define RING_A  150
 
 #define LABEL_R 230
 #define LABEL_G 230
@@ -79,7 +79,7 @@ enum {
     BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT,
     BTN_START, BTN_BACK,
     BTN_A, BTN_B, BTN_X, BTN_Y,
-    BTN_LB, BTN_LT, BTN_RB, BTN_RT
+    BTN_LT, BTN_RT, BTN_HAND
 };
 
 typedef struct {
@@ -105,14 +105,18 @@ static int     s_win_w, s_win_h;
 static uint8_t s_digital;
 static uint8_t s_analog[8];       /* A B X Y Black White L R */
 static int     s_held[CONTROL_COUNT];
+static size_t  s_nctrl;
 
 static float   s_stick_x[2], s_stick_y[2];
 static float   s_stick_ox[2], s_stick_oy[2];
 static int     s_stick_owned[2];
 
-typedef struct { SDL_FingerID id; int ctrl; } finger;
+typedef struct { SDL_FingerID id; int ctrl; unsigned buttons; } finger;
 static finger  s_fingers[MAX_FINGERS];
 static int     s_nfingers;
+
+/* Where the face diamond was built, so its zone can be derived from a touch. */
+static float   s_face_cx, s_face_cy, s_face_r;
 
 /* The D-pad is one zone, not four buttons: a finger lands on it and then slides
  * between directions the way a thumb moves across the pad on the console, which
@@ -132,49 +136,50 @@ static SDL_Texture *s_disc;       /* white circle, tinted per use */
 static void build_layout(control *c, float w, float h)
 {
     size_t n = 0;
+    /* Two columns on the left: the triggers and the stick hug the edge, the
+     * D-pad sits inboard of them. tx is measured to the circle, so L and R end
+     * up the same distance from their own edge. */
     float lx = 0.12f * w;
+    float tx = 0.085f * w;
 
     memset(c, 0, sizeof(control) * CONTROL_COUNT);
 
     /* Sticks first. The right stick has no resting place: it appears where the
-     * camera finger lands. */
-    c[n++] = (control){ KIND_STICK, lx, 0.72f * h, 0.105f * h, BTN_NONE, 0, "L", kLabel };
+     * board-press finger lands. */
+    c[n++] = (control){ KIND_STICK, tx, 0.60f * h, 0.105f * h, BTN_NONE, 0, "L", kLabel };
     c[n++] = (control){ KIND_STICK, w * 0.75f, 0.60f * h, 0.095f * h, BTN_NONE, 1, "R", kLabel };
 
     /* D-pad, right of the left stick. */
     {
-        float dx = lx + 0.26f * h, dy = 0.86f * h, arm = 0.078f * h, dr = 0.042f * h;
+        float dx = lx + 0.26f * h, dy = 0.80f * h, arm = 0.097f * h, dr = 0.052f * h;
         c[n++] = (control){ KIND_ARROW, dx, dy - arm, dr, BTN_UP, 0, "", kLabel };
         c[n++] = (control){ KIND_ARROW, dx, dy + arm, dr, BTN_DOWN, 1, "", kLabel };
         c[n++] = (control){ KIND_ARROW, dx - arm, dy, dr, BTN_LEFT, 2, "", kLabel };
         c[n++] = (control){ KIND_ARROW, dx + arm, dy, dr, BTN_RIGHT, 3, "", kLabel };
     }
 
-    /* LT over LB above the left stick. The reference also puts L3 here; SSX 3
-     * binds nothing to a stick click, so the button would be dead. */
-    {
-        float br = 0.048f * h;
-        c[n++] = (control){ KIND_TRIGGER, lx, 0.355f * h, br, BTN_LT, 0, "LT", kLabel };
-        c[n++] = (control){ KIND_BUTTON, lx, 0.475f * h, br, BTN_LB, 0, "LB", kLabel };
-    }
+    /* One larger trigger per side, where the trigger and bumper pair used to sit:
+     * SSX 3 binds nothing to a bumper that a trigger does not already do. */
+    c[n++] = (control){ KIND_TRIGGER, tx, 0.265f * h, 0.080f * h, BTN_LT, 0, "L", kLabel };
 
     /* A/B/X/Y diamond in the lower right, with the Xbox 360 letter colours. */
     {
-        float fx = w - 0.52f * h, fy = 0.80f * h, fs = 0.097f * h, fr = 0.052f * h;
+        float fx = w - (lx + 0.26f * h), fy = 0.80f * h;
+        float fs = 0.097f * h, fr = 0.052f * h;
         SDL_Color a = FACE_A, b = FACE_B, x = FACE_X, y = FACE_Y;
         c[n++] = (control){ KIND_BUTTON, fx, fy + fs, fr, BTN_A, 0, "A", a };
         c[n++] = (control){ KIND_BUTTON, fx + fs, fy, fr, BTN_B, 0, "B", b };
         c[n++] = (control){ KIND_BUTTON, fx - fs, fy, fr, BTN_X, 0, "X", x };
         c[n++] = (control){ KIND_BUTTON, fx, fy - fs, fr, BTN_Y, 0, "Y", y };
+        s_face_cx = fx; s_face_cy = fy; s_face_r = fs;
+        /* One handstand button where White and Black sat: the game gives both
+         * of those buttons the same handstand, so a pair is two ways to ask for
+         * one thing. */
+        c[n++] = (control){ KIND_BUTTON, fx + 2.57f * fs, fy + 0.575f * fs, fr,
+                            BTN_HAND, 0, "HAND", kLabel };
     }
 
-    /* RT over RB at the right edge (no R3, for the same reason). */
-    {
-        float br = 0.048f * h;
-        float rx = w - 0.17f * h;
-        c[n++] = (control){ KIND_TRIGGER, rx, 0.47f * h, br, BTN_RT, 1, "RT", kLabel };
-        c[n++] = (control){ KIND_BUTTON, rx, 0.59f * h, br, BTN_RB, 0, "RB", kLabel };
-    }
+    c[n++] = (control){ KIND_TRIGGER, w - tx, 0.265f * h, 0.080f * h, BTN_RT, 1, "R", kLabel };
 
     /* BACK and START in the middle of the top edge. */
     {
@@ -182,6 +187,8 @@ static void build_layout(control *c, float w, float h)
         c[n++] = (control){ KIND_BUTTON, 0.44f * w, 0.075f * h, sr, BTN_BACK, 0, "BACK", kLabel };
         c[n++] = (control){ KIND_BUTTON, 0.56f * w, 0.075f * h, sr, BTN_START, 0, "START", kLabel };
     }
+
+    s_nctrl = n;
 }
 
 /* ---- drawing ---------------------------------------------------------- */
@@ -277,26 +284,38 @@ static const unsigned char *glyph(char ch)
     static const unsigned char A[7] = { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 };
     static const unsigned char B[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E };
     static const unsigned char C[7] = { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E };
+    static const unsigned char D[7] = { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E };
     static const unsigned char E[7] = { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F };
     static const unsigned char K[7] = { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 };
     static const unsigned char L[7] = { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F };
+    static const unsigned char P[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 };
     static const unsigned char R[7] = { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 };
     static const unsigned char S[7] = { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E };
     static const unsigned char T[7] = { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 };
     static const unsigned char X[7] = { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 };
     static const unsigned char Y[7] = { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 };
+    static const unsigned char H[7] = { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 };
+    static const unsigned char I[7] = { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E };
+    static const unsigned char N[7] = { 0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11 };
+    static const unsigned char W[7] = { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 };
     static const unsigned char N3[7] = { 0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E };
 
     switch (ch) {
         case 'A': return A;
         case 'B': return B;
         case 'C': return C;
+        case 'D': return D;
         case 'E': return E;
+        case 'H': return H;
+        case 'I': return I;
         case 'K': return K;
         case 'L': return L;
+        case 'N': return N;
+        case 'P': return P;
         case 'R': return R;
         case 'S': return S;
         case 'T': return T;
+        case 'W': return W;
         case 'X': return X;
         case 'Y': return Y;
         case '3': return N3;
@@ -362,6 +381,7 @@ static void draw_control(SDL_Renderer *ren, SDL_Texture *disc, const control *c,
     SDL_Color fill = held ? (SDL_Color){ HELD_R, HELD_G, HELD_B, HELD_A }
                           : (SDL_Color){ FILL_R, FILL_G, FILL_B, FILL_A };
     SDL_Color ring = { RING_R, RING_G, RING_B, RING_A };
+    SDL_Color label = c->label_color;
 
     if (c->r <= 0.0f)
         return;
@@ -371,8 +391,10 @@ static void draw_control(SDL_Renderer *ren, SDL_Texture *disc, const control *c,
         float cy = held ? s_stick_oy[c->index] : c->y;
         float kx, ky;
 
-        /* The camera stick shows only while it is being used. */
-        if (c->index == 1 && !held)
+        /* Neither stick is drawn at rest: any touch on empty screen space works
+         * the stick of that half, so a parked ring only reads as a control that
+         * has to be hit. */
+        if (!held)
             return;
         fill_circle(ren, disc, cx, cy, c->r, fill);
         ring_circle(ren, cx, cy, c->r, ring);
@@ -405,7 +427,7 @@ static void draw_control(SDL_Renderer *ren, SDL_Texture *disc, const control *c,
     }
 
     if (c->label && c->label[0])
-        draw_label(ren, c->label, c->x, c->y, c->r, c->label_color);
+        draw_label(ren, c->label, c->x, c->y, c->r, label);
 }
 
 /* ---- pad state -------------------------------------------------------- */
@@ -447,13 +469,17 @@ static void set_button(int button, int on)
         { BTN_START, 0x10, -1 }, { BTN_BACK,  0x20, -1 },
         { BTN_A,     0x00,  0 }, { BTN_B,     0x00,  1 },
         { BTN_X,     0x00,  2 }, { BTN_Y,     0x00,  3 },
-        /* The original Xbox pad has analog L/R instead of LB/RB: a bumper
-         * sends the same trigger, fully pressed. */
-        { BTN_LB,    0x00,  6 }, { BTN_LT,    0x00,  6 },
-        { BTN_RB,    0x00,  7 }, { BTN_RT,    0x00,  7 },
+        /* Analog channels, in the pad's own order: A B X Y Black White L R. */
+        { BTN_LT,    0x00,  6 }, { BTN_RT,    0x00,  7 },
     };
     size_t i;
 
+    /* Black and White are the same handstand in SSX 3, so one button sets both
+     * and whichever the guest looks at is satisfied. */
+    if (button == BTN_HAND) {
+        s_analog[4] = s_analog[5] = (uint8_t)(on ? 255 : 0);
+        return;
+    }
     for (i = 0; i < sizeof map / sizeof map[0]; i++) {
         if (map[i].button != button)
             continue;
@@ -614,10 +640,19 @@ static void dpad_end(const control *c)
 }
 
 /* The button under a finger, or the stick of that half of the screen. */
+static unsigned buttons_at(const control *c, float px, float py);
+static int nearest_button(const control *c, unsigned mask, float px, float py);
+
 static int hit_test(const control *c, float px, float py, float w)
 {
     int best = -1, i;
     float best_distance = 1e30f;
+    unsigned under = buttons_at(c, px, py);
+
+    /* A thumb inside a button's capture ring means that button, even where the
+     * point would otherwise fall through to a stick's resting place. */
+    if (under)
+        return nearest_button(c, under, px, py);
 
     /* The whole pad is a hit, out to the rim of an arrow and a little past it,
      * so a thumb sliding across it never falls through to the stick. */
@@ -665,7 +700,7 @@ static int hit_test(const control *c, float px, float py, float w)
         }
     }
 
-    for (i = 0; i < CONTROL_COUNT; i++) {
+    for (i = 0; i < (int)s_nctrl; i++) {
         float capture, distance;
         if (c[i].r <= 0.0f || c[i].kind == KIND_STICK)
             continue;
@@ -679,6 +714,121 @@ static int hit_test(const control *c, float px, float py, float w)
     if (best >= 0)
         return best;
     return px < w * 0.5f ? 0 : 1;   /* controls 0 and 1 are the sticks */
+}
+
+/* The diamond works the way the D-pad does: each axis fires on its own once the
+ * finger is off the centre that way, so a thumb planted between Y and B is
+ * both. Four separate circles only ever overlapped in a narrow lens between
+ * neighbours and not at all across the diamond. */
+#define FACE_SWITCH  0.45f
+#define FACE_REACH   1.42f
+
+
+static unsigned face_zone(const control *c, float px, float py)
+{
+    float dx = px - s_face_cx, dy = py - s_face_cy;
+    float t = FACE_SWITCH * s_face_r, lim = FACE_REACH * s_face_r;
+    unsigned mask = 0;
+    int i;
+
+    if (s_face_r <= 0.0f || dx * dx + dy * dy > lim * lim)
+        return 0;
+
+    for (i = 0; i < (int)s_nctrl; i++) {
+        int on;
+
+        switch (c[i].button) {
+        case BTN_Y: on = dy <= -t; break;
+        case BTN_A: on = dy >= t; break;
+        case BTN_X: on = dx <= -t; break;
+        case BTN_B: on = dx >= t; break;
+        default: continue;
+        }
+        if (on)
+            mask |= 1u << i;
+    }
+    if (!mask) {
+        /* Dead centre still means a button: whichever way the thumb leans. */
+        int want = fabsf(dx) > fabsf(dy) ? (dx < 0.0f ? BTN_X : BTN_B)
+                                         : (dy < 0.0f ? BTN_Y : BTN_A);
+
+        for (i = 0; i < (int)s_nctrl; i++)
+            if (c[i].button == want) {
+                mask = 1u << i;
+                break;
+            }
+    }
+    return mask;
+}
+
+/* Buttons under a point: the diamond by its axes, everything else by a capture
+ * ring wider than the drawn circle. */
+static unsigned buttons_at(const control *c, float px, float py)
+{
+    unsigned mask = face_zone(c, px, py);
+    int i;
+
+    for (i = 0; i < (int)s_nctrl; i++) {
+        float r, dx, dy;
+
+        if (c[i].kind != KIND_BUTTON && c[i].kind != KIND_TRIGGER)
+            continue;
+        if (c[i].button == BTN_A || c[i].button == BTN_B ||
+            c[i].button == BTN_X || c[i].button == BTN_Y)
+            continue;           /* the diamond is a zone, not four circles */
+        r = c[i].r * 1.55f;
+        dx = px - c[i].x;
+        dy = py - c[i].y;
+        if (dx * dx + dy * dy <= r * r)
+            mask |= 1u << i;
+    }
+    return mask;
+}
+
+static int nearest_button(const control *c, unsigned mask, float px, float py)
+{
+    int i, best = -1;
+    float best_d = 1e30f;
+
+    for (i = 0; i < (int)s_nctrl; i++) {
+        float dx, dy, d;
+
+        if (!(mask & (1u << i)))
+            continue;
+        dx = px - c[i].x;
+        dy = py - c[i].y;
+        d = dx * dx + dy * dy;
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best >= 0 ? best : 0;
+}
+
+/* The pad state is the union of every finger's set, so two fingers may hold the
+ * same button and one of them lifting does not release it. */
+static void apply_buttons(const control *c)
+{
+    static unsigned logged;
+    unsigned all = 0;
+    int i, f;
+
+    for (f = 0; f < s_nfingers; f++)
+        all |= s_fingers[f].buttons;
+    if (all != logged) {
+        logged = all;
+        TLOG("buttons %04x", all);
+    }
+    for (i = 0; i < (int)s_nctrl; i++) {
+        int want = (int)((all >> i) & 1u);
+
+        if (s_held[i] == want)
+            continue;
+        s_held[i] = want;
+        if (c[i].button != BTN_NONE)
+            set_button(c[i].button, want);
+    }
 }
 
 static int finger_slot(SDL_FingerID id)
@@ -774,6 +924,7 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
     switch (e->type) {
         case SDL_FINGERDOWN: {
             SDL_FingerID id = e->tfinger.fingerId;
+            unsigned mask = 0;
 
             if (s_pad_present || s_nfingers >= MAX_FINGERS || finger_slot(id) >= 0)
                 return;
@@ -787,7 +938,6 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
                 if (s_dp_id >= 0)
                     return;             /* one finger owns the D-pad */
                 s_dp_id = id;
-                dpad_start(ctrl, px, py);
             } else if (ctrl[index].kind == KIND_STICK) {
                 /* A stick centres under the finger, kept fully on screen; one
                  * finger per stick. */
@@ -803,16 +953,25 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
                                            ? (float)s_win_h - ctrl[index].r : py);
                 s_stick_x[stick] = s_stick_y[stick] = 0.0f;
             } else {
-                s_held[index] = 1;
-                if (ctrl[index].button != BTN_NONE)
-                    set_button(ctrl[index].button, 1);
+                /* Every button under the thumb, not only the nearest. A landing
+                 * on the rim between two still takes the closest one. */
+                mask = buttons_at(ctrl, px, py);
+                if (!mask)
+                    mask = 1u << index;
             }
+            s_fingers[s_nfingers].id = id;
+            s_fingers[s_nfingers].ctrl = index;
+            s_fingers[s_nfingers].buttons = mask;
+            s_nfingers++;
+
+            if (ctrl[index].kind == KIND_ARROW)
+                dpad_start(ctrl, px, py);
+            else if (ctrl[index].kind != KIND_STICK)
+                apply_buttons(ctrl);
+
             if (getenv("RECOMP_TOUCH_TRACE"))
                 TLOG("down id=%lld %.0f,%.0f -> %d %s", (long long)id, (double)px,
                      (double)py, index, ctrl[index].label);
-            s_fingers[s_nfingers].id = id;
-            s_fingers[s_nfingers].ctrl = index;
-            s_nfingers++;
             return;
         }
         case SDL_FINGERMOTION: {
@@ -829,8 +988,13 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
                 return;
             }
             index = s_fingers[slot].ctrl;
-            if (ctrl[index].kind != KIND_STICK)
+            if (ctrl[index].kind != KIND_STICK) {
+                if (ctrl[index].kind != KIND_ARROW) {
+                    s_fingers[slot].buttons = buttons_at(ctrl, px, py);
+                    apply_buttons(ctrl);
+                }
                 return;
+            }
             stick = ctrl[index].index;
             {
                 float x = (px - s_stick_ox[stick]) / (ctrl[index].r * 0.85f);
@@ -862,9 +1026,7 @@ void touch_pad_event(const SDL_Event *e, SDL_Renderer *ren)
                 s_stick_owned[stick] = 0;
                 s_stick_x[stick] = s_stick_y[stick] = 0.0f;
             } else {
-                s_held[index] = 0;
-                if (ctrl[index].button != BTN_NONE)
-                    set_button(ctrl[index].button, 0);
+                apply_buttons(ctrl);
             }
             return;
         }
@@ -898,7 +1060,7 @@ void touch_pad_render(SDL_Renderer *ren)
      * window pixels, so drop that transform for these draws. */
     SDL_RenderGetLogicalSize(ren, &saved_w, &saved_h);
     SDL_RenderSetLogicalSize(ren, 0, 0);
-    for (i = 0; i < CONTROL_COUNT; i++)
+    for (i = 0; i < (int)s_nctrl; i++)
         draw_control(ren, disc, &ctrl[i], s_held[i]);
     SDL_RenderSetLogicalSize(ren, saved_w, saved_h);
 }
